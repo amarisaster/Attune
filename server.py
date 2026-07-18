@@ -93,6 +93,25 @@ def _cfg_int(env_name: str, json_key: str, default: int) -> int:
     return default
 
 
+def _cfg_float(env_name: str, json_key: str, default: float) -> float:
+    # Same explicit-env-wins-and-skips-JSON rule as _cfg_int above.
+    v = os.environ.get(env_name)
+    if v is not None:
+        v = v.strip()
+        if v == '':
+            return default
+        try:
+            return float(v)
+        except ValueError:
+            print(f'[attune] WARNING: {env_name}={v!r} is not a number, using default {default}',
+                  file=sys.stderr, flush=True)
+            return default
+    v = _JSON_CONFIG.get(json_key)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    return default
+
+
 def _cfg_list(env_name: str, json_key: str, default=()) -> list:
     v = os.environ.get(env_name)
     if v is not None:
@@ -127,6 +146,12 @@ CONFIG = {
     'stt_chunk_seconds': _cfg_int('ATTUNE_STT_CHUNK_SECONDS', 'stt_chunk_seconds', 28),
     'stt_chunk_overlap_seconds': _cfg_int('ATTUNE_STT_CHUNK_OVERLAP_SECONDS', 'stt_chunk_overlap_seconds', 2),
     'stt_max_chunks': _cfg_int('ATTUNE_STT_MAX_CHUNKS', 'stt_max_chunks', 20),
+    # Below this RMS level (dBFS), webhook STT is skipped for that audio --
+    # near-silent audio has no linguistic content to condition on, and
+    # whisper-class STT hallucinates fluent-sounding invented text rather
+    # than reporting silence (see energy_gate.py's docstring). Applies to
+    # both single-shot short clips and, per-chunk, the chunked path.
+    'stt_silence_dbfs': _cfg_float('ATTUNE_STT_SILENCE_DBFS', 'stt_silence_dbfs', -50.0),
     'max_upload_bytes': _cfg_int('ATTUNE_MAX_UPLOAD_BYTES', 'max_upload_bytes', 50 * 1024 * 1024),
     # transcript rides argv; Windows CreateProcess caps ~32k
     'max_transcript_chars': _cfg_int('ATTUNE_MAX_TRANSCRIPT_CHARS', 'max_transcript_chars', 16 * 1024),
@@ -153,6 +178,7 @@ if CONFIG['stt_mode'] == 'webhook' and not CONFIG['stt_url']:
 print(
     '[attune] config: port={port} token_file={token_file} ffmpeg_dir={ffmpeg_dir} '
     'stt_mode={stt_mode} whisper_model={whisper_model} stt_url={stt_url} '
+    'stt_silence_dbfs={stt_silence_dbfs} '
     'allowed_audio_prefixes={n_prefixes} configured max_upload_bytes={max_upload_bytes} '
     'drops_dir={drops_dir} drops_keep={drops_keep} public_base_url={public_base_url}'.format(
         port=CONFIG['port'],
@@ -161,6 +187,7 @@ print(
         stt_mode=CONFIG['stt_mode'],
         whisper_model=CONFIG['whisper_model'] if CONFIG['stt_mode'] == 'local' else '-',
         stt_url=CONFIG['stt_url'] or '(unset)',
+        stt_silence_dbfs=CONFIG['stt_silence_dbfs'],
         n_prefixes=len(CONFIG['allowed_audio_prefixes']),
         max_upload_bytes=CONFIG['max_upload_bytes'],
         drops_dir=CONFIG['drops_dir'],
@@ -178,8 +205,9 @@ print(
 if CONFIG['ffmpeg_dir']:
     os.environ.setdefault('ATTUNE_FFMPEG_DIR', CONFIG['ffmpeg_dir'])
 
-from singing import analyze_singing, format_singing_section  # noqa: E402  (after config)
+from singing import analyze_singing, format_singing_section, load_wav  # noqa: E402  (after config)
 from stt_stitch import GAP_MARKER, stitch_transcripts  # noqa: E402  (after config)
+from energy_gate import should_skip_stt  # noqa: E402  (after config)
 
 # ---------------------------------------------------------------------------
 # END CONFIGURATION
@@ -194,6 +222,7 @@ STT_MAX_BYTES = CONFIG['stt_max_bytes']
 STT_CHUNK_SECONDS = max(1, CONFIG['stt_chunk_seconds'])
 STT_CHUNK_OVERLAP_SECONDS = max(0, CONFIG['stt_chunk_overlap_seconds'])
 STT_MAX_CHUNKS = max(1, CONFIG['stt_max_chunks'])
+STT_SILENCE_DBFS = CONFIG['stt_silence_dbfs']
 # Audio at/under this duration uses the original single-shot webhook path,
 # byte-identical to pre-chunking behavior. Longer audio is chunked instead
 # of being skipped -- see _resolve_stt/_webhook_stt_chunked.
@@ -301,9 +330,20 @@ def _check_auth(authorization: Optional[str]) -> None:
 app = FastAPI(title='Attune')
 
 
+def _local_whisper_available() -> bool:
+    """Whether faster-whisper is importable in this environment (the analyzer
+    runs on sys.executable, i.e. this same env). find_spec is cheap — no
+    heavy import happens here."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec('faster_whisper') is not None
+    except Exception:
+        return False
+
+
 @app.get('/health')
 async def health():
-    return {
+    body = {
         'status': 'ok',
         'ffmpeg': shutil.which('ffmpeg', path=_subprocess_env()['PATH']) is not None,
         'engine': f"acoustics-local/stt-{CONFIG['stt_mode']}",
@@ -312,6 +352,13 @@ async def health():
         # scripts/get-seven-ears.py has been run.
         'engine_present': SEVEN_EARS_SCRIPT.exists(),
     }
+    if CONFIG['stt_mode'] == 'local':
+        # The #1 "why no transcripts?" cause: Install step 3 (the vendor
+        # requirements that pull in faster-whisper) was skipped. Surface it
+        # where a single GET can find it (first community deployment hit
+        # exactly this, 2026-07-18).
+        body['local_whisper_available'] = _local_whisper_available()
+    return body
 
 
 _SUFFIX_BY_CONTENT_TYPE = {
@@ -384,6 +431,25 @@ def _webhook_token() -> str:
         return Path(token_file).expanduser().read_text(encoding='utf-8').strip()
     except OSError:
         return ''
+
+
+def _gate_check(path: str) -> tuple:
+    """Decode `path` (already a small re-encoded audio file, same as
+    singing.py's own decode path) and check the RMS energy gate. Returns
+    (skip: bool, reason: str) -- see energy_gate.should_skip_stt.
+
+    Fails OPEN: a decode failure (corrupt chunk, ffmpeg unavailable, etc.)
+    returns (False, '') -- an undeterminable energy level must never
+    silently suppress a legitimate transcription attempt. Runs synchronously
+    (ffmpeg subprocess + numpy) -- callers already run this from a worker
+    thread (the chunked path) or wrap it in asyncio.to_thread themselves
+    (the single-shot path in _resolve_stt)."""
+    try:
+        x, sr = load_wav(path)
+    except Exception as e:
+        print(f'[attune] energy gate: decode failed, not skipping: {e}', file=sys.stderr, flush=True)
+        return False, ''
+    return should_skip_stt(x, sr, STT_SILENCE_DBFS)
 
 
 def _webhook_stt(path: str, language: str = '') -> str:
@@ -561,6 +627,16 @@ def _webhook_stt_chunked(path: str, language: str, duration_s: float) -> tuple:
                 transcripts.append(GAP_MARKER)
                 partial = True
                 continue
+            gate_skip, gate_reason = _gate_check(chunk_path)
+            if gate_skip:
+                # Silence is not missing data -- it's the absence of speech.
+                # Contribute NOTHING to the transcript: no text, no
+                # GAP_MARKER (a gap marker means real content is unknown;
+                # here the content IS known -- there wasn't any).
+                end = start + STT_CHUNK_SECONDS
+                print(f'[attune] chunk {i + 1}/{len(chunk_pairs)} ({start:.0f}s-{end:.0f}s) '
+                      f'skipped: below energy gate ({gate_reason})', file=sys.stderr, flush=True)
+                continue
             t = _webhook_stt(chunk_path, language) or _webhook_stt(chunk_path, language)
             if t:
                 transcripts.append(t)
@@ -627,16 +703,39 @@ async def _resolve_stt(tmp_path: str, transcript: str, language: str = '') -> tu
             if size > STT_MAX_BYTES:
                 stt_skipped = True
             else:
-                transcript = (await asyncio.to_thread(_webhook_stt, tmp_path, language)).strip()
+                gate_skip, gate_reason = await asyncio.to_thread(_gate_check, tmp_path)
+                if gate_skip:
+                    # Same "silence contributes nothing" posture as the
+                    # chunked path above -- empty transcript, no webhook
+                    # call, not treated as stt_skipped (that flag means
+                    # "STT was owed but couldn't be attempted", not "there
+                    # was nothing to transcribe").
+                    print(f'[attune] audio skipped: below energy gate ({gate_reason})',
+                          file=sys.stderr, flush=True)
+                else:
+                    transcript = (await asyncio.to_thread(_webhook_stt, tmp_path, language)).strip()
         args = ['--transcript', transcript, '--transcript-source', 'stt_api'] if transcript else []
         return transcript, args, stt_skipped, stt_partial
     # mode == 'none': acoustics only
     return '', [], False, False
 
 
+# Client-visible note when local STT was requested but faster-whisper isn't
+# installed. A silent empty transcript looks like a broken deploy (the first
+# community deployment reported exactly this); the cause and the fix must be
+# discoverable from the RESPONSE, not just server stderr.
+STT_UNAVAILABLE_NOTE = (
+    'transcript unavailable: ATTUNE_STT_MODE=local but faster-whisper is not '
+    'installed — run Install step 3 (pip install -r vendor/seven-ears/requirements.txt) '
+    'or set ATTUNE_STT_MODE to webhook/none; see /health local_whisper_available'
+)
+
+
 async def _spawn_analyzer(args: list, filename: str, log_tag: str):
-    """Run the seven-ears analyzer subprocess. Returns the completed process
-    on success, or None after logging on any failure.
+    """Run the seven-ears analyzer subprocess. Returns (proc, stt_fell_back):
+    the completed process on success or None after logging on any failure,
+    plus whether the local-STT fallback below fired (so callers can surface
+    STT_UNAVAILABLE_NOTE instead of a silent empty transcript).
 
     Local-STT resilience: if ATTUNE_STT_MODE=local but faster-whisper isn't
     installed, seven-ears exits nonzero when whisper is explicitly requested.
@@ -645,6 +744,7 @@ async def _spawn_analyzer(args: list, filename: str, log_tag: str):
     singing analysis) with an empty transcript, as documented in the README.
     """
     attempt_args = args
+    stt_fell_back = False
     for attempt in (1, 2):
         try:
             proc = await asyncio.to_thread(
@@ -658,21 +758,22 @@ async def _spawn_analyzer(args: list, filename: str, log_tag: str):
             )
         except subprocess.TimeoutExpired:
             print(f'{log_tag} analysis timed out for {filename}', file=sys.stderr, flush=True)
-            return None
+            return None, stt_fell_back
         except OSError as e:
             print(f'{log_tag} analysis spawn failed: {e}', file=sys.stderr, flush=True)
-            return None
+            return None, stt_fell_back
         if proc.returncode == 0:
-            return proc
+            return proc, stt_fell_back
         stderr_tail = proc.stderr[-800:] if proc.stderr else ''
         if attempt == 1 and '--stt' in attempt_args and 'faster_whisper' in stderr_tail:
             print(f'{log_tag} local STT unavailable (faster-whisper not importable); retrying acoustics-only', file=sys.stderr, flush=True)
+            stt_fell_back = True
             i = attempt_args.index('--stt')
             attempt_args = attempt_args[:i] + attempt_args[i + 4:]  # drop --stt whisper --whisper-model <m>
             continue
         print(f'{log_tag} analysis failed: {stderr_tail}', file=sys.stderr, flush=True)
-        return None
-    return None
+        return None, stt_fell_back
+    return None, stt_fell_back
 
 
 @app.post('/api/analyze')
@@ -731,7 +832,7 @@ async def analyze(
             args[3:3] = extra_args
 
             print(f'[attune] spawning analysis for {filename}', file=sys.stderr, flush=True)
-            proc = await _spawn_analyzer(args, filename, '[attune]')
+            proc, stt_fell_back = await _spawn_analyzer(args, filename, '[attune]')
             if proc is None:
                 # Details stay in the server log; clients get a fixed message.
                 raise HTTPException(500, 'analysis failed')
@@ -740,6 +841,8 @@ async def analyze(
                 data = json.loads(proc.stdout)
             except json.JSONDecodeError:
                 raise HTTPException(500, 'analysis failed')
+            if stt_fell_back:
+                data['stt_note'] = STT_UNAVAILABLE_NOTE
 
             # Overwrite with the friendly filename before rendering the card —
             # format_card requires data['file'] and this prevents the OS temp
@@ -1133,7 +1236,7 @@ async def _mcp_analyze(audio_url: str, transcript: str, language: str = '') -> s
             args = [PYTHON, str(SEVEN_EARS_SCRIPT), tmp_path, '--json']
             args[3:3] = extra_args
             print(f'[attune-mcp] spawning analysis for {filename}', file=sys.stderr, flush=True)
-            proc = await _spawn_analyzer(args, filename, '[attune-mcp]')
+            proc, stt_fell_back = await _spawn_analyzer(args, filename, '[attune-mcp]')
             if proc is None:
                 return 'Analysis failed.'
             try:
@@ -1156,6 +1259,8 @@ async def _mcp_analyze(audio_url: str, transcript: str, language: str = '') -> s
             parts.append('Transcript omitted: note exceeds the transcription size limit.')
         if stt_partial:
             parts.append('Transcript is partial — some segments failed transcription.')
+        if stt_fell_back:
+            parts.append(STT_UNAVAILABLE_NOTE[0].upper() + STT_UNAVAILABLE_NOTE[1:])
         return '\n\n'.join(parts)
     finally:
         with contextlib.suppress(OSError):

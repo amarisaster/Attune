@@ -73,6 +73,7 @@ default, without consulting the JSON file either.
 | `ATTUNE_STT_CHUNK_SECONDS` | `stt_chunk_seconds` | `28` | Length of each chunk when `stt_mode=webhook` audio exceeds ~30s |
 | `ATTUNE_STT_CHUNK_OVERLAP_SECONDS` | `stt_chunk_overlap_seconds` | `2` | Overlap between consecutive chunks, so a word split at a chunk boundary isn't lost — the duplicated overlap text is deduplicated when chunks are stitched back together |
 | `ATTUNE_STT_MAX_CHUNKS` | `stt_max_chunks` | `20` | Hard cap on chunks per note (20 × 28s ≈ 9 minutes with the defaults); audio longer than that is transcribed only up to the cap, with the truncation logged |
+| `ATTUNE_STT_SILENCE_DBFS` | `stt_silence_dbfs` | `-50.0` | RMS energy gate (dBFS) for `stt_mode=webhook`, both single-shot and per-chunk. Audio at/below this level is never sent to the webhook — see below |
 | `ATTUNE_MAX_UPLOAD_BYTES` | `max_upload_bytes` | `52428800` (50 MiB) | Upload size cap, enforced streaming |
 | `ATTUNE_MAX_TRANSCRIPT_CHARS` | `max_transcript_chars` | `16384` | Caller-supplied transcript length cap, measured in **UTF-8 bytes** (not characters). The key name says "chars" for backward compatibility with existing configs, but the enforcement has always been byte-based. |
 | `ATTUNE_DROPS_DIR` | `drops_dir` | `./drops` | Directory where voice drops are stored (relative paths resolve next to `server.py`, not the process cwd). Created on boot |
@@ -89,7 +90,10 @@ default, without consulting the JSON file either.
   faster-whisper otherwise fails to import, Attune detects the failed
   transcription attempt and automatically retries the analysis
   acoustics-only — you get a response with acoustics (and singing
-  analysis) but an empty `transcript` field, rather than an error.
+  analysis) but an empty `transcript` field, rather than an error. When
+  that fallback fires, the response says so: `measurements.stt_note`
+  explains the cause and fix, and the MCP tool appends the same note to
+  its text reply (see Troubleshooting below).
 - `webhook` — Attune POSTs the raw audio to `ATTUNE_STT_URL` with
   `Authorization: Bearer <contents of ATTUNE_STT_TOKEN_FILE>`, and expects
   back `{"transcript": "..."}`. Use this if you already run STT elsewhere
@@ -106,6 +110,22 @@ default, without consulting the JSON file either.
   `ATTUNE_STT_MAX_CHUNKS` chunks is transcribed only up to that cap, with
   the truncation logged server-side. An optional `language` hint (see
   Endpoints below) is forwarded to every chunk's request when supplied.
+
+  Before any webhook call — single-shot or per-chunk — Attune checks an
+  **RMS energy gate**: it decodes the audio (the same ffmpeg→WAV→numpy path
+  `singing.py` uses) and computes its RMS level in dBFS. Audio at or below
+  `ATTUNE_STT_SILENCE_DBFS` (default `-50.0`), or audio whose voiced
+  fraction is essentially zero (a brief loud transient — a laugh, a cough —
+  sitting in an otherwise-silent chunk), skips the webhook call entirely.
+  This exists because whisper-class STT hallucinates on near-silent audio
+  rather than reporting silence: a 7.6-second trailing giggle-then-silence
+  chunk was observed to come back as fluent, entirely invented Indonesian,
+  with no signal distinguishing that confabulation from a real
+  transcription. A gated chunk contributes **nothing** to the transcript —
+  no text, and deliberately no `GAP_MARKER` either, since a gap marker
+  means real content is unknown, and a gated chunk's content **is** known:
+  there wasn't any. A gated single-shot clip returns an empty transcript
+  the same way `stt_mode=none` would.
 - `none` — no transcription at all; acoustics (and singing analysis) only.
 
 If a caller already supplies a transcript with the request, it's used as-is
@@ -127,7 +147,11 @@ On first boot, a bearer token is generated and written to
   required. `ffmpeg` reports whether ffmpeg is discoverable on `PATH` (or
   `ATTUNE_FFMPEG_DIR`); `engine_present` reports whether the vendored engine
   itself (`vendor/seven-ears/seven_ears_card.py`) exists — `false` until
-  `scripts/get-seven-ears.py` has been run (see Install step 1).
+  `scripts/get-seven-ears.py` has been run (see Install step 1). When
+  `ATTUNE_STT_MODE=local`, the response also includes
+  `local_whisper_available`: whether faster-whisper is importable in the
+  server's environment — `false` means transcripts will be empty until
+  Install step 3 has been run.
 - `POST /api/analyze` — multipart form, field `audio` (the recording, required),
   optional `transcript`, and optional `language` (an STT language hint like
   `en`/`ja`, forwarded to the webhook when `stt_mode=webhook` — ignored
@@ -231,6 +255,24 @@ it like any other unlisted URL.
   control (a reverse proxy, Cloudflare Tunnel, Tailscale Funnel, etc.) rather
   than binding it directly to a public IP.
 
+## Troubleshooting
+
+**No transcripts — analysis works, acoustics and singing come back, but
+`transcript` is always empty.** In `local` mode (the default) this almost
+always means faster-whisper isn't installed — it lives in the *vendored*
+requirements, not Attune's own, so it's easy to miss:
+
+1. `GET /health` — if it shows `"local_whisper_available": false`, that's
+   the confirmation.
+2. Run Install step 3: `venv/bin/pip install -r vendor/seven-ears/requirements.txt`
+   (`venv\Scripts\pip.exe` on Windows), then restart the server.
+3. If faster-whisper can't run on your machine at all (see Platform notes
+   below), set `ATTUNE_STT_MODE=webhook` or `none` instead.
+
+Responses affected by this fallback carry a `measurements.stt_note` field
+(and the MCP tool appends the same note to its reply), so the degradation
+is visible to callers rather than silent.
+
 ## Platform notes
 
 - **Windows with Smart App Control (or similar DLL-signing enforcement)**
@@ -268,11 +310,13 @@ TEMPO : ~92 BPM candidate (low confidence — rubato likely)
 - `server.py` — FastAPI wrapper (port defaults to 8452; see Configuration)
 - `singing.py` — pure-numpy singing analysis (melody, vibrato, key, dynamics)
 - `stt_stitch.py` — pure overlap-dedup stitching for chunked webhook STT transcripts (no I/O; see STT modes above)
+- `energy_gate.py` — pure RMS/voiced-fraction silence gate for webhook STT (no I/O; see STT modes above)
 - `drop.html` — the self-contained voice drop page served at `GET /drop` (read once at startup, no templating)
 - `drops/` — default storage directory for voice drops (gitignored; see `ATTUNE_DROPS_DIR`)
 - `vendor/seven-ears/` — pinned upstream engine (fetched by `scripts/get-seven-ears.py`)
 - `scripts/get-seven-ears.py` — vendoring/setup script, stdlib only
 - `test_singing.py` — smoke tests for `singing.py`, run directly with no pytest needed
 - `test_stitch.py` — smoke tests for `stt_stitch.py`, run directly with no pytest needed
+- `test_energy_gate.py` — smoke tests for `energy_gate.py`'s RMS/voiced-fraction silence gate, run directly with no pytest needed
 - `test_drop_validation.py` — smoke tests for the `/drops/<name>` filename allowlist regex, run directly with no pytest needed
 - `attune.config.example.json` — configuration template

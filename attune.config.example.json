@@ -20,6 +20,7 @@
   "stt_chunk_seconds": 28,
   "stt_chunk_overlap_seconds": 2,
   "stt_max_chunks": 20,
+  "stt_silence_dbfs": -50.0,
 
   "max_upload_bytes": 52428800,
   "max_transcript_chars": 16384,
