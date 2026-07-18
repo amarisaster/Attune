@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Attune — Voice Drop</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0;
+    background: #0f1115;
+    color: #e8e8ec;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    min-height: 100%;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 24px;
+    gap: 22px;
+    text-align: center;
+  }
+  h1 {
+    font-size: .95rem;
+    font-weight: 600;
+    color: #8d8d99;
+    margin: 0;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  #recordBtn {
+    width: 140px; height: 140px;
+    border-radius: 50%;
+    border: none;
+    background: #d64550;
+    color: #fff;
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 0 0 6px rgba(214, 69, 80, .15);
+    transition: transform .15s ease, background .2s ease, box-shadow .2s ease;
+    touch-action: manipulation;
+  }
+  #recordBtn:active { transform: scale(.96); }
+  #recordBtn.recording {
+    background: #444b58;
+    box-shadow: 0 0 0 6px rgba(68, 75, 88, .25);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 6px rgba(214, 69, 80, .15); }
+    50% { box-shadow: 0 0 0 14px rgba(214, 69, 80, .05); }
+  }
+  #timer {
+    font-variant-numeric: tabular-nums;
+    font-size: 1.5rem;
+    color: #cfcfda;
+    min-height: 1.8rem;
+  }
+  #status { color: #9a9aa5; font-size: .95rem; min-height: 1.3rem; }
+  #result {
+    width: 100%; max-width: 420px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  #result[hidden] { display: none; }
+  audio { width: 100%; }
+  #urlRow { display: flex; gap: 8px; }
+  #urlBox {
+    flex: 1;
+    background: #1a1d24;
+    border: 1px solid #2c303a;
+    border-radius: 10px;
+    color: #e8e8ec;
+    padding: 12px;
+    font-size: .9rem;
+    min-width: 0;
+  }
+  button.small {
+    background: #2c303a;
+    color: #e8e8ec;
+    border: none;
+    border-radius: 10px;
+    padding: 12px 18px;
+    font-size: .95rem;
+    cursor: pointer;
+    min-height: 44px;
+    min-width: 44px;
+  }
+  button.small:active { background: #383d49; }
+  #copyStatus { font-size: .85rem; color: #7fd08a; min-height: 1.1rem; }
+</style>
+</head>
+<body>
+  <h1>Attune Voice Drop</h1>
+  <button id="recordBtn" type="button">Record</button>
+  <div id="timer">00:00</div>
+  <div id="status"></div>
+
+  <div id="result" hidden>
+    <audio id="player" controls></audio>
+    <div id="urlRow">
+      <input id="urlBox" type="text" readonly aria-label="Drop link">
+      <button id="copyBtn" class="small" type="button">Copy</button>
+    </div>
+    <div id="copyStatus"></div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  var K = new URLSearchParams(location.search).get('k') || '';
+
+  var btn = document.getElementById('recordBtn');
+  var timerEl = document.getElementById('timer');
+  var statusEl = document.getElementById('status');
+  var resultEl = document.getElementById('result');
+  var player = document.getElementById('player');
+  var urlBox = document.getElementById('urlBox');
+  var copyBtn = document.getElementById('copyBtn');
+  var copyStatus = document.getElementById('copyStatus');
+
+  var mediaRecorder = null;
+  var chunks = [];
+  var startedAt = 0;
+  var timerHandle = null;
+
+  function pickMimeType() {
+    var candidates = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/mp4',
+      'audio/ogg;codecs=opus'
+    ];
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return '';
+    for (var i = 0; i < candidates.length; i++) {
+      if (MediaRecorder.isTypeSupported(candidates[i])) return candidates[i];
+    }
+    return '';
+  }
+
+  function fmtTime(ms) {
+    var s = Math.floor(ms / 1000);
+    var mm = String(Math.floor(s / 60)).padStart(2, '0');
+    var ss = String(s % 60).padStart(2, '0');
+    return mm + ':' + ss;
+  }
+
+  function tick() {
+    timerEl.textContent = fmtTime(Date.now() - startedAt);
+  }
+
+  function start() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      statusEl.textContent = 'This browser cannot record audio.';
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      var mimeType = pickMimeType();
+      try {
+        mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType: mimeType }) : new MediaRecorder(stream);
+      } catch (e) {
+        mediaRecorder = new MediaRecorder(stream);
+      }
+      chunks = [];
+      mediaRecorder.addEventListener('dataavailable', function (e) {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      });
+      mediaRecorder.addEventListener('stop', function () {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        onStopped();
+      });
+      mediaRecorder.start();
+      startedAt = Date.now();
+      timerHandle = setInterval(tick, 200);
+      tick();
+      btn.textContent = 'Stop';
+      btn.classList.add('recording');
+      statusEl.textContent = 'Recording...';
+      resultEl.hidden = true;
+      copyStatus.textContent = '';
+    }).catch(function () {
+      statusEl.textContent = 'Microphone access denied or unavailable.';
+    });
+  }
+
+  function stop() {
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+    clearInterval(timerHandle);
+    mediaRecorder.stop();
+    btn.textContent = 'Record';
+    btn.classList.remove('recording');
+    statusEl.textContent = 'Uploading...';
+  }
+
+  function onStopped() {
+    var mimeType = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
+    var blob = new Blob(chunks, { type: mimeType });
+    if (player.src) URL.revokeObjectURL(player.src);
+    player.src = URL.createObjectURL(blob);
+
+    fetch('/api/drop?k=' + encodeURIComponent(K), {
+      method: 'POST',
+      headers: { 'Content-Type': mimeType },
+      body: blob
+    }).then(function (resp) {
+      if (!resp.ok) {
+        return resp.text().then(function (text) {
+          throw new Error('upload failed (' + resp.status + ') ' + (text || '').slice(0, 200));
+        });
+      }
+      return resp.json();
+    }).then(function (data) {
+      showResult(data.url);
+    }).catch(function (e) {
+      statusEl.textContent = 'Upload failed: ' + e.message;
+    });
+  }
+
+  function showResult(url) {
+    statusEl.textContent = 'Saved.';
+    resultEl.hidden = false;
+    urlBox.value = url;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () {
+        copyStatus.textContent = 'Link copied to clipboard.';
+      }, function () {
+        copyStatus.textContent = 'Could not auto-copy — use the Copy button.';
+      });
+    } else {
+      copyStatus.textContent = 'Use the Copy button to copy the link.';
+    }
+  }
+
+  copyBtn.addEventListener('click', function () {
+    urlBox.focus();
+    urlBox.select();
+    urlBox.setSelectionRange(0, urlBox.value.length);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(urlBox.value).then(function () {
+        copyStatus.textContent = 'Link copied to clipboard.';
+      }, function () {
+        copyStatus.textContent = 'Copy failed — select and copy manually.';
+      });
+    } else {
+      try {
+        document.execCommand('copy');
+        copyStatus.textContent = 'Link copied to clipboard.';
+      } catch (e) {
+        copyStatus.textContent = 'Copy failed — select and copy manually.';
+      }
+    }
+  });
+
+  btn.addEventListener('click', function () {
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+      start();
+    } else {
+      stop();
+    }
+  });
+
+  if (!K) {
+    statusEl.textContent = 'Warning: no access token in this link — upload will likely fail.';
+  }
+})();
+</script>
+</body>
+</html>

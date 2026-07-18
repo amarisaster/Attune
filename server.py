@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from typing import Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import uvicorn
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -120,9 +122,23 @@ CONFIG = {
     'stt_url': _cfg_str('ATTUNE_STT_URL', 'stt_url', ''),
     'stt_token_file': _cfg_str('ATTUNE_STT_TOKEN_FILE', 'stt_token_file', ''),
     'stt_max_bytes': _cfg_int('ATTUNE_STT_MAX_BYTES', 'stt_max_bytes', 6 * 1024 * 1024),
+    # Chunked webhook STT (used only in stt_mode=webhook, only for audio
+    # longer than _STT_CHUNK_TRIGGER_S -- see _resolve_stt/_webhook_stt_chunked).
+    'stt_chunk_seconds': _cfg_int('ATTUNE_STT_CHUNK_SECONDS', 'stt_chunk_seconds', 28),
+    'stt_chunk_overlap_seconds': _cfg_int('ATTUNE_STT_CHUNK_OVERLAP_SECONDS', 'stt_chunk_overlap_seconds', 2),
+    'stt_max_chunks': _cfg_int('ATTUNE_STT_MAX_CHUNKS', 'stt_max_chunks', 20),
     'max_upload_bytes': _cfg_int('ATTUNE_MAX_UPLOAD_BYTES', 'max_upload_bytes', 50 * 1024 * 1024),
     # transcript rides argv; Windows CreateProcess caps ~32k
     'max_transcript_chars': _cfg_int('ATTUNE_MAX_TRANSCRIPT_CHARS', 'max_transcript_chars', 16 * 1024),
+    # Voice drop page (GET /drop, POST /api/drop, GET /drops/<name>) -- see
+    # README's "Voice drop page" section.
+    'drops_dir': _cfg_str('ATTUNE_DROPS_DIR', 'drops_dir', './drops'),
+    'drops_keep': _cfg_int('ATTUNE_DROPS_KEEP', 'drops_keep', 200),
+    # Empty means "derive from the request's Host header" -- see
+    # _drop_public_url. Set this explicitly when Attune sits behind a
+    # reverse proxy / tunnel that terminates TLS or rewrites Host, so
+    # returned drop links match the externally reachable origin.
+    'public_base_url': _cfg_str('ATTUNE_PUBLIC_BASE_URL', 'public_base_url', ''),
 }
 
 if CONFIG['stt_mode'] not in ('local', 'webhook', 'none'):
@@ -137,7 +153,8 @@ if CONFIG['stt_mode'] == 'webhook' and not CONFIG['stt_url']:
 print(
     '[attune] config: port={port} token_file={token_file} ffmpeg_dir={ffmpeg_dir} '
     'stt_mode={stt_mode} whisper_model={whisper_model} stt_url={stt_url} '
-    'allowed_audio_prefixes={n_prefixes} configured max_upload_bytes={max_upload_bytes}'.format(
+    'allowed_audio_prefixes={n_prefixes} configured max_upload_bytes={max_upload_bytes} '
+    'drops_dir={drops_dir} drops_keep={drops_keep} public_base_url={public_base_url}'.format(
         port=CONFIG['port'],
         token_file=CONFIG['token_file'],
         ffmpeg_dir=CONFIG['ffmpeg_dir'] or '(relying on PATH)',
@@ -146,6 +163,9 @@ print(
         stt_url=CONFIG['stt_url'] or '(unset)',
         n_prefixes=len(CONFIG['allowed_audio_prefixes']),
         max_upload_bytes=CONFIG['max_upload_bytes'],
+        drops_dir=CONFIG['drops_dir'],
+        drops_keep=CONFIG['drops_keep'],
+        public_base_url=CONFIG['public_base_url'] or '(derived from Host header)',
     ),
     file=sys.stderr, flush=True,
 )
@@ -159,6 +179,7 @@ if CONFIG['ffmpeg_dir']:
     os.environ.setdefault('ATTUNE_FFMPEG_DIR', CONFIG['ffmpeg_dir'])
 
 from singing import analyze_singing, format_singing_section  # noqa: E402  (after config)
+from stt_stitch import GAP_MARKER, stitch_transcripts  # noqa: E402  (after config)
 
 # ---------------------------------------------------------------------------
 # END CONFIGURATION
@@ -170,6 +191,13 @@ MAX_UPLOAD_BYTES = CONFIG['max_upload_bytes']
 MAX_TRANSCRIPT_CHARS = CONFIG['max_transcript_chars']
 BODY_READ_IDLE_TIMEOUT_S = 30  # per-chunk gap allowed while receiving the upload
 STT_MAX_BYTES = CONFIG['stt_max_bytes']
+STT_CHUNK_SECONDS = max(1, CONFIG['stt_chunk_seconds'])
+STT_CHUNK_OVERLAP_SECONDS = max(0, CONFIG['stt_chunk_overlap_seconds'])
+STT_MAX_CHUNKS = max(1, CONFIG['stt_max_chunks'])
+# Audio at/under this duration uses the original single-shot webhook path,
+# byte-identical to pre-chunking behavior. Longer audio is chunked instead
+# of being skipped -- see _resolve_stt/_webhook_stt_chunked.
+_STT_CHUNK_TRIGGER_S = 30.0
 
 # Semaphore(2): UP TO TWO analyses may run concurrently, not one-at-a-time --
 # a second request acquires the free slot immediately. The locked() pre-check
@@ -226,6 +254,33 @@ def _load_token() -> str:
 
 
 API_TOKEN = _load_token()
+
+# Voice drop storage. Relative ATTUNE_DROPS_DIR (the default, './drops') is
+# resolved against BASE_DIR, not the process's cwd, so it lands next to
+# server.py regardless of how/where the process was launched. Created on
+# boot -- a missing drops dir must never surface as a 500 on first upload.
+DROPS_DIR = Path(CONFIG['drops_dir']).expanduser()
+if not DROPS_DIR.is_absolute():
+    DROPS_DIR = BASE_DIR / DROPS_DIR
+DROPS_DIR = DROPS_DIR.resolve()
+DROPS_DIR.mkdir(parents=True, exist_ok=True)
+DROPS_KEEP = max(0, CONFIG['drops_keep'])
+
+# Read once at startup -- no template rendering, the page pulls its own `k`
+# from location.search client-side (see drop.html).
+DROP_PAGE_HTML = (BASE_DIR / 'drop.html').read_text(encoding='utf-8')
+
+_DROP_UNAUTHORIZED_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attune - Voice Drop</title>
+<style>
+  body { background:#0f1115; color:#e8e8ec; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:24px; text-align:center; }
+  div { max-width: 420px; }
+  h1 { font-size:1.2rem; color:#d64550; }
+</style></head>
+<body><div><h1>Unauthorized</h1><p>This link is missing or has an invalid access token.</p></div></body></html>"""
 
 
 def _subprocess_env() -> dict:
@@ -331,26 +386,37 @@ def _webhook_token() -> str:
         return ''
 
 
-def _webhook_stt(path: str) -> str:
+def _webhook_stt(path: str, language: str = '') -> str:
     """Transcribe via the configured ATTUNE_STT_URL webhook. Best-effort.
     Reads the audio file from disk here, inside the worker thread, rather
     than the caller holding a large blob on the event loop. Never loads a
     file bigger than STT_MAX_BYTES into memory -- this is the last line of
     defense even though callers are expected to skip calling this at all
-    once they know the file exceeds that size."""
+    once they know the file exceeds that size (or, for chunked audio, to
+    have already split it into chunks that individually fit).
+
+    `language` is an optional caller-supplied hint (e.g. 'en', 'ja'),
+    forwarded as a `?language=` query param on the webhook URL when set --
+    omitted entirely when empty, so a caller that never passes it gets the
+    exact same request as before this parameter existed."""
+    import urllib.parse
     import urllib.request
     token = _webhook_token()
-    if not token or not CONFIG['stt_url']:
+    url = CONFIG['stt_url']
+    if not token or not url:
         return ''
     try:
         if os.path.getsize(path) > STT_MAX_BYTES:
             return ''
     except OSError:
         return ''
+    if language:
+        sep = '&' if '?' in url else '?'
+        url = f'{url}{sep}language={urllib.parse.quote(language)}'
     with open(path, 'rb') as f:
         blob = f.read()
     req = urllib.request.Request(
-        CONFIG['stt_url'], data=blob, method='POST',
+        url, data=blob, method='POST',
         headers={
             'Authorization': f'Bearer {token}',
             'Content-Type': 'application/octet-stream',
@@ -367,32 +433,205 @@ def _webhook_stt(path: str) -> str:
         return ''
 
 
-async def _resolve_stt(tmp_path: str, transcript: str) -> tuple:
+def _probe_duration_s(path: str) -> Optional[float]:
+    """Best-effort audio duration in seconds via ffprobe, falling back to
+    parsing `ffmpeg -i`'s stderr banner if ffprobe isn't discoverable.
+    Returns None on any failure -- callers treat that the same as "audio is
+    short enough for single-shot" (see _resolve_stt), never blocking
+    transcription just because duration couldn't be determined."""
+    env = _subprocess_env()
+    ffprobe = shutil.which('ffprobe', path=env['PATH'])
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', path],
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return float(proc.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+    ffmpeg = shutil.which('ffmpeg', path=env['PATH']) or 'ffmpeg'
+    try:
+        proc = subprocess.run(
+            [ffmpeg, '-i', path], capture_output=True, text=True, env=env, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', proc.stderr or '')
+    if not m:
+        return None
+    h, mi, s = m.groups()
+    try:
+        return int(h) * 3600 + int(mi) * 60 + float(s)
+    except ValueError:
+        return None
+
+
+def _split_chunks(path: str, duration_s: float) -> list:
+    """Split `path` into overlapping segments (ATTUNE_STT_CHUNK_SECONDS wide,
+    ATTUNE_STT_CHUNK_OVERLAP_SECONDS overlap between consecutive segments),
+    capped at ATTUNE_STT_MAX_CHUNKS. Every segment is RE-ENCODED -- there is
+    deliberately no `-c copy` stream-copy fast path. A stream copy with `-ss`
+    snaps to the source container's nearest keyframe/cluster boundary rather
+    than the exact requested timestamp (documented ffmpeg behavior), which
+    silently shifts where a chunk actually starts and makes the overlap-word
+    math in stt_stitch.py lie about how much audio two chunks actually share.
+    `-ss` placed BEFORE `-i` (input seeking) combined with re-encoding is
+    sample-accurate in modern ffmpeg, so that's what every chunk gets.
+
+    Encoded to opus/webm, mono, ~32kbps -- more than adequate for
+    whisper-class STT and comfortably small, but still checked against
+    STT_MAX_BYTES same as before. Returns a list of (start_seconds, path)
+    tuples in chronological order -- the caller owns deleting the paths.
+    Runs entirely in the calling worker thread (subprocess.run, not
+    asyncio.to_thread here -- callers wrap the whole chunking+upload
+    sequence in one to_thread call)."""
+    starts = []
+    step = max(1, STT_CHUNK_SECONDS - STT_CHUNK_OVERLAP_SECONDS)
+    t = 0.0
+    while t < duration_s and len(starts) < STT_MAX_CHUNKS:
+        starts.append(t)
+        t += step
+
+    env = _subprocess_env()
+    ffmpeg = shutil.which('ffmpeg', path=env['PATH']) or 'ffmpeg'
+    chunks = []
+    for start in starts:
+        enc_path = tempfile.NamedTemporaryFile(delete=False, suffix='.webm').name
+        enc_ok = False
+        try:
+            proc = subprocess.run(
+                [ffmpeg, '-y', '-v', 'error', '-ss', str(start), '-i', path, '-t', str(STT_CHUNK_SECONDS),
+                 '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', enc_path],
+                capture_output=True, text=True, env=env, timeout=60,
+            )
+            enc_ok = (proc.returncode == 0 and os.path.exists(enc_path)
+                      and 0 < os.path.getsize(enc_path) <= STT_MAX_BYTES)
+        except (OSError, subprocess.TimeoutExpired):
+            enc_ok = False
+        if enc_ok:
+            chunks.append((start, enc_path))
+        else:
+            with contextlib.suppress(OSError):
+                os.unlink(enc_path)
+            # A failed SPLIT must surface exactly like a failed POST: a gap
+            # marker in the assembled transcript, never a silent omission the
+            # stitcher would then dedup across.
+            chunks.append((start, None))
+            print(f'[attune] chunk at {start:.0f}s failed to split -- gap marker inserted', file=sys.stderr, flush=True)
+    return chunks
+
+
+def _webhook_stt_chunked(path: str, language: str, duration_s: float) -> tuple:
+    """Webhook STT for audio longer than _STT_CHUNK_TRIGGER_S: split into
+    overlapping chunks, POST them to the webhook SEQUENTIALLY (never
+    concurrently -- this keeps the whole operation, and its ffmpeg/network
+    work, inside one worker thread with a bounded, easy-to-reason-about
+    request pattern), then stitch the resulting per-chunk transcripts back
+    together with the deterministic overlap-dedup heuristic in stt_stitch.py.
+
+    Per chunk: one retry (a fresh POST, not a resend of the same request
+    object) on failure. If both attempts fail, that chunk's position gets an
+    explicit stt_stitch.GAP_MARKER placeholder instead of being silently
+    dropped -- the stitcher never dedups across a gap boundary -- and the
+    missing time range is logged. Returns (stitched_transcript, partial)
+    where `partial` is True iff at least one chunk was persistently lost;
+    same '' contract as _webhook_stt when every chunk is lost or none split."""
+    chunk_pairs = _split_chunks(path, duration_s)
+    if not chunk_pairs:
+        print('[attune] chunking produced no usable segments', file=sys.stderr, flush=True)
+        return '', False
+    step = max(1, STT_CHUNK_SECONDS - STT_CHUNK_OVERLAP_SECONDS)
+    if len(chunk_pairs) >= STT_MAX_CHUNKS and duration_s > STT_MAX_CHUNKS * step + STT_CHUNK_OVERLAP_SECONDS:
+        print(f'[attune] audio ({duration_s:.0f}s) exceeds ATTUNE_STT_MAX_CHUNKS={STT_MAX_CHUNKS} -- '
+              'transcribing only the first portion', file=sys.stderr, flush=True)
+
+    transcripts = []
+    partial = False
+    try:
+        for i, (start, chunk_path) in enumerate(chunk_pairs):
+            if chunk_path is None:
+                # Split itself failed for this range (see _split_chunks) —
+                # same honest treatment as a failed POST.
+                end = start + STT_CHUNK_SECONDS
+                print(f'[attune] chunk {i + 1}/{len(chunk_pairs)} ({start:.0f}s-{end:.0f}s) '
+                      'was never split -- inserting gap marker', file=sys.stderr, flush=True)
+                transcripts.append(GAP_MARKER)
+                partial = True
+                continue
+            t = _webhook_stt(chunk_path, language) or _webhook_stt(chunk_path, language)
+            if t:
+                transcripts.append(t)
+            else:
+                end = start + STT_CHUNK_SECONDS
+                print(f'[attune] chunk {i + 1}/{len(chunk_pairs)} ({start:.0f}s-{end:.0f}s) '
+                      'failed to transcribe after 1 retry -- inserting gap marker',
+                      file=sys.stderr, flush=True)
+                transcripts.append(GAP_MARKER)
+                partial = True
+    finally:
+        for _, chunk_path in chunk_pairs:
+            if chunk_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(chunk_path)
+
+    return stitch_transcripts(transcripts, overlap_seconds=STT_CHUNK_OVERLAP_SECONDS), partial
+
+
+async def _resolve_stt(tmp_path: str, transcript: str, language: str = '') -> tuple:
     """Given a temp audio file and any already-known transcript, return
-    (transcript, extra_cli_args, stt_skipped) honoring ATTUNE_STT_MODE.
-    A caller-supplied transcript always wins and short-circuits STT_MODE
-    entirely -- this is what keeps a frontend that already runs its own STT
-    (like this deployment's) behaving identically regardless of STT_MODE."""
+    (transcript, extra_cli_args, stt_skipped, stt_partial) honoring
+    ATTUNE_STT_MODE. A caller-supplied transcript always wins and
+    short-circuits STT_MODE entirely -- this is what keeps a frontend that
+    already runs its own STT (like this deployment's) behaving identically
+    regardless of STT_MODE.
+
+    `stt_partial` is True only when the chunked webhook path lost at least
+    one chunk after its retry (see _webhook_stt_chunked) -- callers surface
+    this as measurements['stt_partial']=True (REST) or an explicit "partial"
+    note (MCP) rather than silently returning a transcript with an
+    undisclosed gap in it.
+
+    `language` is an optional hint forwarded to the webhook (see
+    _webhook_stt); per-chunk auto language detection is still the default
+    when it's empty, deliberately -- a multilingual singer isn't forced into
+    one language just because chunking kicked in."""
     if transcript:
-        return transcript, ['--transcript', transcript, '--transcript-source', 'stt_api'], False
+        return transcript, ['--transcript', transcript, '--transcript-source', 'stt_api'], False, False
 
     mode = CONFIG['stt_mode']
     if mode == 'local':
-        return '', ['--stt', 'whisper', '--whisper-model', CONFIG['whisper_model']], False
+        return '', ['--stt', 'whisper', '--whisper-model', CONFIG['whisper_model']], False, False
     if mode == 'webhook':
         stt_skipped = False
-        try:
-            size = os.path.getsize(tmp_path)
-        except OSError:
-            size = 0
-        if size > STT_MAX_BYTES:
-            stt_skipped = True
+        stt_partial = False
+        # Duration decides single-shot vs. chunked -- NOT the byte-size cap
+        # anymore, which used to skip transcription outright for anything
+        # over STT_MAX_BYTES. Oversized-but-short-enough audio still takes
+        # the byte-cap-gated single-shot path below (unchanged); anything
+        # over _STT_CHUNK_TRIGGER_S seconds gets chunked instead of skipped.
+        duration_s = await asyncio.to_thread(_probe_duration_s, tmp_path)
+        if duration_s is not None and duration_s > _STT_CHUNK_TRIGGER_S:
+            transcript, stt_partial = await asyncio.to_thread(_webhook_stt_chunked, tmp_path, language, duration_s)
+            transcript = transcript.strip()
         else:
-            transcript = (await asyncio.to_thread(_webhook_stt, tmp_path)).strip()
+            # Short audio, or duration unknown (ffprobe/ffmpeg unavailable or
+            # failed to parse) -- single-shot path, byte-identical to the
+            # pre-chunking behavior.
+            try:
+                size = os.path.getsize(tmp_path)
+            except OSError:
+                size = 0
+            if size > STT_MAX_BYTES:
+                stt_skipped = True
+            else:
+                transcript = (await asyncio.to_thread(_webhook_stt, tmp_path, language)).strip()
         args = ['--transcript', transcript, '--transcript-source', 'stt_api'] if transcript else []
-        return transcript, args, stt_skipped
+        return transcript, args, stt_skipped, stt_partial
     # mode == 'none': acoustics only
-    return '', [], False
+    return '', [], False, False
 
 
 async def _spawn_analyzer(args: list, filename: str, log_tag: str):
@@ -441,6 +680,7 @@ async def analyze(
     request: Request,
     audio: UploadFile = File(...),
     transcript: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
     authorization: Optional[str] = Header(None),
 ):
     _check_auth(authorization)
@@ -474,15 +714,22 @@ async def analyze(
         t = (transcript or '').strip()
         if len(t.encode('utf-8')) > MAX_TRANSCRIPT_CHARS:
             raise HTTPException(413, 'transcript too long')
+        lang = (language or '').strip()
 
-        t, extra_args, _stt_skipped = await _resolve_stt(tmp_path, t)
-
-        args = [PYTHON, str(SEVEN_EARS_SCRIPT), tmp_path, '--json']
-        args[3:3] = extra_args
-
+        # Semaphore acquired BEFORE the STT/probe/chunk pipeline (not just
+        # around the analyzer subprocess) -- _resolve_stt can itself spawn
+        # ffprobe/ffmpeg (chunking) and a sequence of webhook POSTs, and that
+        # work needs to be bounded by the same two concurrent-analysis slots
+        # as everything else, or a third+ caller could pile up unbounded
+        # ffmpeg/webhook work while only two analyzer subprocesses run.
         if _ANALYSIS_SLOTS.locked():
             raise HTTPException(429, 'analysis busy, retry shortly')
         async with _ANALYSIS_SLOTS:
+            t, extra_args, _stt_skipped, stt_partial = await _resolve_stt(tmp_path, t, lang)
+
+            args = [PYTHON, str(SEVEN_EARS_SCRIPT), tmp_path, '--json']
+            args[3:3] = extra_args
+
             print(f'[attune] spawning analysis for {filename}', file=sys.stderr, flush=True)
             proc = await _spawn_analyzer(args, filename, '[attune]')
             if proc is None:
@@ -498,6 +745,11 @@ async def analyze(
             # format_card requires data['file'] and this prevents the OS temp
             # path from leaking into the rendered card text.
             data['file'] = filename
+            if stt_partial:
+                # At least one chunk was lost after its retry -- the
+                # transcript has an explicit GAP_MARKER gap in it. Surface
+                # this so callers don't silently trust a partial transcript.
+                data['stt_partial'] = True
             card_text = await asyncio.to_thread(_render_card, data)
 
             singing, section = await _run_singing_analysis(tmp_path)
@@ -516,6 +768,156 @@ async def analyze(
             tmp.close()
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Voice drop page — GET /drop, POST /api/drop, GET /drops/<name>
+# ---------------------------------------------------------------------------
+# A tiny self-contained browser page for recording a voice note and getting
+# back a shareable link (e.g. to paste into a claude.ai chat that has the
+# Attune MCP connector as a custom connector). GET /drop and POST /api/drop
+# both require the same ?k=<token> the MCP endpoint uses — claude.ai's
+# custom connectors already require this pattern, so the drop page rides
+# the same auth model rather than inventing a second one. GET /drops/<name>
+# itself is deliberately NOT gated: the link IS the capability, exactly
+# like any public storage bucket link (see README's Security notes). See
+# ATTUNE_DROPS_DIR / ATTUNE_DROPS_KEEP / ATTUNE_PUBLIC_BASE_URL above.
+#
+# Design note: GET /drop authenticates IN-ROUTE (query k before any content
+# is served) rather than in AnalyzeGuardMiddleware. The middleware's job is
+# auth-BEFORE-BODY-PARSING for endpoints that receive large bodies; a GET
+# has no request body to protect, so in-route auth is security-equivalent
+# and keeps the middleware's scope honest.
+
+DROPS_NAME_RE = re.compile(r'^[A-Za-z0-9_-]+\.(webm|ogg|m4a|mp3|wav)$')
+
+_CONTENT_TYPE_BY_DROP_SUFFIX = {
+    '.webm': 'audio/webm',
+    '.ogg': 'audio/ogg',
+    '.m4a': 'audio/mp4',
+    '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
+}
+
+
+@app.get('/drop')
+async def drop_page(k: str = ''):
+    if not secrets.compare_digest(k, API_TOKEN):
+        return Response(_DROP_UNAUTHORIZED_HTML, status_code=401, media_type='text/html')
+    return Response(DROP_PAGE_HTML, media_type='text/html')
+
+
+def _drop_public_url(request: Request, name: str) -> str:
+    base = CONFIG['public_base_url']
+    if not base:
+        # Derived from the request's Host header -- fine for direct access.
+        # If Attune sits behind a reverse proxy / tunnel that terminates
+        # TLS and/or rewrites Host, set ATTUNE_PUBLIC_BASE_URL explicitly
+        # so the returned link matches the externally reachable origin
+        # rather than whatever internal host/port the proxy forwarded to.
+        host = request.headers.get('host') or request.url.netloc
+        base = f'{request.url.scheme}://{host}'
+    return f"{base.rstrip('/')}/drops/{name}"
+
+
+def _prune_drops() -> None:
+    """After a new drop, delete the oldest files beyond ATTUNE_DROPS_KEEP
+    (simple mtime sort). Best-effort: a stat/unlink failure on one file is
+    logged and skipped rather than aborting the whole prune. Runs in a
+    worker thread (see caller) since iterdir/stat/unlink are blocking."""
+    try:
+        # Only prune files WE created (regex-valid drop names). A user who
+        # points ATTUNE_DROPS_DIR at a shared folder must never have
+        # unrelated files deleted by our retention policy.
+        entries = [p for p in DROPS_DIR.iterdir() if p.is_file() and DROPS_NAME_RE.match(p.name)]
+    except OSError as e:
+        print(f'[attune] drops prune: could not list {DROPS_DIR}: {e}', file=sys.stderr, flush=True)
+        return
+    if len(entries) <= DROPS_KEEP:
+        return
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    entries.sort(key=_mtime, reverse=True)
+    for stale in entries[DROPS_KEEP:]:
+        try:
+            stale.unlink()
+            print(f'[attune] drops prune: deleted {stale.name} (over ATTUNE_DROPS_KEEP={DROPS_KEEP})',
+                  file=sys.stderr, flush=True)
+        except OSError as e:
+            print(f'[attune] drops prune: failed to delete {stale.name}: {e}', file=sys.stderr, flush=True)
+
+
+@app.post('/api/drop')
+async def api_drop(request: Request):
+    # Defense-in-depth only, same posture as /api/analyze's own re-check:
+    # the real auth-before-body and size-cap guarantees live in
+    # AnalyzeGuardMiddleware (registered below, now covering this path too).
+    k = request.query_params.get('k', '')
+    if not secrets.compare_digest(k, API_TOKEN):
+        raise HTTPException(401, 'Unauthorized')
+
+    cl = request.headers.get('content-length')
+    if cl is not None and cl.isdigit() and int(cl) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f'audio exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MiB limit')
+
+    # Raw-body upload (documented in README): the request body IS the audio
+    # bytes, not multipart -- simpler for a small self-contained page's
+    # fetch(..., {body: blob}) than constructing multipart/form-data.
+    content_type = (request.headers.get('content-type') or '').split(';', 1)[0].strip().lower()
+    suffix = _SUFFIX_BY_CONTENT_TYPE.get(content_type, '.webm')
+    name = secrets.token_urlsafe(16) + suffix
+    dest_path = DROPS_DIR / name
+
+    total = 0
+    f = open(dest_path, 'wb')
+    try:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, f'audio exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MiB limit')
+            await asyncio.to_thread(f.write, chunk)
+    except BaseException:
+        f.close()
+        with contextlib.suppress(OSError):
+            os.unlink(dest_path)
+        raise
+    f.close()
+
+    if total == 0:
+        with contextlib.suppress(OSError):
+            os.unlink(dest_path)
+        raise HTTPException(400, 'empty upload')
+
+    await asyncio.to_thread(_prune_drops)
+
+    return {'url': _drop_public_url(request, name)}
+
+
+@app.get('/drops/{name}')
+async def get_drop(name: str):
+    # Strict allowlist-by-regex: no traversal segment, no path separator, no
+    # percent-encoding, no extension outside the fixed set can ever match --
+    # `name` here is already the decoded path segment Starlette routed on,
+    # and the {name} converter itself cannot contain '/'. The containment
+    # check below is belt-and-suspenders on top of that, not load-bearing.
+    if not DROPS_NAME_RE.fullmatch(name):
+        raise HTTPException(404, 'Not found')
+    path = (DROPS_DIR / name).resolve()
+    if path.parent != DROPS_DIR or not path.is_file():
+        raise HTTPException(404, 'Not found')
+    media_type = _CONTENT_TYPE_BY_DROP_SUFFIX.get(path.suffix.lower(), 'application/octet-stream')
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={'Cache-Control': 'public, max-age=31536000, immutable'},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -673,13 +1075,20 @@ def _mcp_tool_def() -> dict:
             'properties': {
                 'audio_url': {'type': 'string', 'description': url_description},
                 'transcript': {'type': 'string', 'description': 'Optional transcript of the note, if known'},
+                'language': {
+                    'type': 'string',
+                    'description': (
+                        "Optional STT language hint (e.g. 'en', 'ja'), forwarded to the STT webhook "
+                        "when ATTUNE_STT_MODE=webhook. Leave unset for per-clip auto-detection."
+                    ),
+                },
             },
             'required': ['audio_url'],
         },
     }
 
 
-async def _mcp_analyze(audio_url: str, transcript: str) -> str:
+async def _mcp_analyze(audio_url: str, transcript: str, language: str = '') -> str:
     prefixes = CONFIG['allowed_audio_prefixes']
     if not prefixes:
         return ('Refused: this server has no ATTUNE_ALLOWED_AUDIO_PREFIXES configured, so '
@@ -710,15 +1119,19 @@ async def _mcp_analyze(audio_url: str, transcript: str) -> str:
             print(f'[attune-mcp] fetch failed: {e}', file=sys.stderr, flush=True)
             return 'Could not fetch that audio URL.'
 
-        # No transcript supplied? Resolve one per ATTUNE_STT_MODE so claude.ai
-        # callers can receive words + acoustics in a single tool call.
-        transcript, extra_args, stt_skipped = await _resolve_stt(tmp_path, transcript)
-
-        args = [PYTHON, str(SEVEN_EARS_SCRIPT), tmp_path, '--json']
-        args[3:3] = extra_args
+        # Semaphore acquired BEFORE the STT/probe/chunk pipeline (not just
+        # around the analyzer subprocess) -- same reasoning as /api/analyze:
+        # _resolve_stt's own ffprobe/ffmpeg/webhook work must be bounded by
+        # the two concurrent-analysis slots too.
         if _ANALYSIS_SLOTS.locked():
             return 'Attune is busy analyzing another note — try again in a moment.'
         async with _ANALYSIS_SLOTS:
+            # No transcript supplied? Resolve one per ATTUNE_STT_MODE so
+            # claude.ai callers can receive words + acoustics in one call.
+            transcript, extra_args, stt_skipped, stt_partial = await _resolve_stt(tmp_path, transcript, language)
+
+            args = [PYTHON, str(SEVEN_EARS_SCRIPT), tmp_path, '--json']
+            args[3:3] = extra_args
             print(f'[attune-mcp] spawning analysis for {filename}', file=sys.stderr, flush=True)
             proc = await _spawn_analyzer(args, filename, '[attune-mcp]')
             if proc is None:
@@ -741,6 +1154,8 @@ async def _mcp_analyze(audio_url: str, transcript: str) -> str:
             parts.append(f'Transcript: {found_transcript}')
         if stt_skipped:
             parts.append('Transcript omitted: note exceeds the transcription size limit.')
+        if stt_partial:
+            parts.append('Transcript is partial — some segments failed transcription.')
         return '\n\n'.join(parts)
     finally:
         with contextlib.suppress(OSError):
@@ -797,6 +1212,7 @@ async def mcp_post(request: Request):
         text = await _mcp_analyze(
             str(tool_args.get('audio_url', '')),
             str(tool_args.get('transcript', '') or '').strip(),
+            str(tool_args.get('language', '') or '').strip(),
         )
         return _rpc_result(req_id, {'content': [{'type': 'text', 'text': text}]})
     return _rpc_error(req_id, -32601, f'method not supported: {method}')
@@ -806,13 +1222,19 @@ async def mcp_post(request: Request):
 # ASGI guard middleware — RULING 1
 # ---------------------------------------------------------------------------
 # Runs OUTERMOST (registered last — Starlette builds the middleware stack
-# last-added-outermost), so it sees every byte of POST /api/analyze before
-# routing, multipart parsing, or CORSMiddleware. Auth-before-body: the
-# Authorization header is checked BEFORE any request body is read. The
-# streamed cap wraps `receive` so an oversized body is rejected mid-stream,
-# never buffered in full. Matching only method=='POST' and path==
-# '/api/analyze' is the explicit OPTIONS exemption — CORS preflights fall
-# through untouched to CORSMiddleware.
+# last-added-outermost), so it sees every byte of POST /api/analyze and
+# POST /api/drop before routing, multipart/body parsing, or CORSMiddleware.
+# Auth-before-body: the credential is checked BEFORE any request body is
+# read. The streamed cap wraps `receive` so an oversized body is rejected
+# mid-stream, never buffered in full. Matching only method=='POST' and path
+# in {'/api/analyze', '/api/drop'} is the explicit OPTIONS exemption — CORS
+# preflights fall through untouched to CORSMiddleware.
+#
+# The two paths authenticate differently, same as their route handlers do:
+# /api/analyze checks the bearer Authorization header; /api/drop checks the
+# ?k= query param (the same credential the /drop page and /mcp both use —
+# claude.ai's custom connectors, and this page's own JS, can't set custom
+# headers without more machinery than a token-in-the-URL needs).
 
 class _BodyTooLarge(Exception):
     pass
@@ -843,22 +1265,32 @@ class AnalyzeGuardMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        path = scope.get('path', '')
         if not (
             scope['type'] == 'http'
             and scope['method'] == 'POST'
-            and scope['path'] == '/api/analyze'
+            and path in ('/api/analyze', '/api/drop')
         ):
             await self.app(scope, receive, send)
             return
 
-        headers = {k.decode('latin-1').lower(): v.decode('latin-1') for k, v in scope['headers']}
-        auth = headers.get('authorization')
-        expected = f'Bearer {API_TOKEN}'
         ok = False
+        # Decoded for BOTH paths: auth (analyze) and the content-length check
+        # below (both). Initializing inside the analyze branch only caused an
+        # UnboundLocalError crash on authenticated /api/drop requests.
+        headers = {k.decode('latin-1').lower(): v.decode('latin-1') for k, v in scope['headers']}
         try:
-            ok = auth is not None and secrets.compare_digest(auth, expected)
+            if path == '/api/analyze':
+                auth = headers.get('authorization')
+                expected = f'Bearer {API_TOKEN}'
+                ok = auth is not None and secrets.compare_digest(auth, expected)
+            else:  # '/api/drop' — auth rides ?k=, like /mcp and /drop
+                query_string = scope.get('query_string', b'').decode('latin-1')
+                qs = urllib.parse.parse_qs(query_string)
+                k = (qs.get('k') or [''])[0]
+                ok = secrets.compare_digest(k, API_TOKEN)
         except TypeError:
-            # Malformed/non-ASCII Authorization header — treat as unauth,
+            # Malformed/non-ASCII header or query value — treat as unauth,
             # never let compare_digest's TypeError surface as a 500.
             ok = False
         if not ok:

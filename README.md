@@ -69,9 +69,15 @@ default, without consulting the JSON file either.
 | `ATTUNE_WHISPER_MODEL` | `whisper_model` | `base.en` | faster-whisper model name, used when `stt_mode=local` |
 | `ATTUNE_STT_URL` | `stt_url` | *(unset)* | Your own STT endpoint, used when `stt_mode=webhook` |
 | `ATTUNE_STT_TOKEN_FILE` | `stt_token_file` | *(unset)* | File containing the bearer token for `ATTUNE_STT_URL` |
-| `ATTUNE_STT_MAX_BYTES` | `stt_max_bytes` | `6291456` (6 MiB) | Size cap before STT is skipped |
+| `ATTUNE_STT_MAX_BYTES` | `stt_max_bytes` | `6291456` (6 MiB) | Per-request byte cap for `stt_mode=webhook`. Audio ≤30s over this cap is skipped (as before); audio >30s is chunked instead (see below) so each individual request still stays under this cap |
+| `ATTUNE_STT_CHUNK_SECONDS` | `stt_chunk_seconds` | `28` | Length of each chunk when `stt_mode=webhook` audio exceeds ~30s |
+| `ATTUNE_STT_CHUNK_OVERLAP_SECONDS` | `stt_chunk_overlap_seconds` | `2` | Overlap between consecutive chunks, so a word split at a chunk boundary isn't lost — the duplicated overlap text is deduplicated when chunks are stitched back together |
+| `ATTUNE_STT_MAX_CHUNKS` | `stt_max_chunks` | `20` | Hard cap on chunks per note (20 × 28s ≈ 9 minutes with the defaults); audio longer than that is transcribed only up to the cap, with the truncation logged |
 | `ATTUNE_MAX_UPLOAD_BYTES` | `max_upload_bytes` | `52428800` (50 MiB) | Upload size cap, enforced streaming |
 | `ATTUNE_MAX_TRANSCRIPT_CHARS` | `max_transcript_chars` | `16384` | Caller-supplied transcript length cap, measured in **UTF-8 bytes** (not characters). The key name says "chars" for backward compatibility with existing configs, but the enforcement has always been byte-based. |
+| `ATTUNE_DROPS_DIR` | `drops_dir` | `./drops` | Directory where voice drops are stored (relative paths resolve next to `server.py`, not the process cwd). Created on boot |
+| `ATTUNE_DROPS_KEEP` | `drops_keep` | `200` | How many drops to retain; after each new drop, the oldest files beyond this count are deleted (mtime sort), with each deletion logged |
+| `ATTUNE_PUBLIC_BASE_URL` | `public_base_url` | *(unset)* | Public origin used to build the `url` returned by `POST /api/drop`, e.g. `https://your-host`. When unset, derived from the request's `Host` header — set this explicitly if Attune sits behind a reverse proxy/tunnel that terminates TLS or rewrites `Host` |
 
 **STT modes**, when the caller doesn't already supply a transcript:
 
@@ -88,7 +94,18 @@ default, without consulting the JSON file either.
   `Authorization: Bearer <contents of ATTUNE_STT_TOKEN_FILE>`, and expects
   back `{"transcript": "..."}`. Use this if you already run STT elsewhere
   (a cloud function, another service), or if local transcription isn't an
-  option on this machine (see Platform notes).
+  option on this machine (see Platform notes). Audio longer than ~30s is
+  automatically **chunked**: split into `ATTUNE_STT_CHUNK_SECONDS`-long
+  pieces (with `ATTUNE_STT_CHUNK_OVERLAP_SECONDS` of overlap between
+  consecutive pieces, so a word split across a chunk boundary isn't lost),
+  POSTed to the webhook one at a time, and stitched back into one transcript
+  — the duplicated overlap text is deduplicated deterministically at each
+  boundary. Each chunk is auto-language-detected independently by default
+  (no `language` forced across chunks), so a note that switches languages
+  partway through isn't mangled into one. A note longer than
+  `ATTUNE_STT_MAX_CHUNKS` chunks is transcribed only up to that cap, with
+  the truncation logged server-side. An optional `language` hint (see
+  Endpoints below) is forwarded to every chunk's request when supplied.
 - `none` — no transcription at all; acoustics (and singing analysis) only.
 
 If a caller already supplies a transcript with the request, it's used as-is
@@ -111,27 +128,77 @@ On first boot, a bearer token is generated and written to
   `ATTUNE_FFMPEG_DIR`); `engine_present` reports whether the vendored engine
   itself (`vendor/seven-ears/seven_ears_card.py`) exists — `false` until
   `scripts/get-seven-ears.py` has been run (see Install step 1).
-- `POST /api/analyze` — multipart form, field `audio` (the recording, required)
-  and optional `transcript`; header `Authorization: Bearer <token>`. Returns
+- `POST /api/analyze` — multipart form, field `audio` (the recording, required),
+  optional `transcript`, and optional `language` (an STT language hint like
+  `en`/`ja`, forwarded to the webhook when `stt_mode=webhook` — ignored
+  otherwise); header `Authorization: Bearer <token>`. Returns
   `{transcript, card_text, measurements}`.
 - `POST /mcp?k=<token>` — a minimal stateless streamable-HTTP MCP endpoint
   exposing one tool, `analyze_voice_note`, for
   [claude.ai custom connectors](https://support.claude.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp).
   The tool takes an `audio_url` (must start with a configured
-  `ATTUNE_ALLOWED_AUDIO_PREFIXES` entry) and an optional `transcript`.
+  `ATTUNE_ALLOWED_AUDIO_PREFIXES` entry), an optional `transcript`, and an
+  optional `language` hint (same meaning as `/api/analyze`'s).
 
   To add it as a custom connector: in claude.ai, go to **Settings → Connectors
   → Add custom connector**, and enter your server's `/mcp` URL with the token
   query param, e.g. `https://your-host/mcp?k=<your-token>`. claude.ai's
   custom connectors can't send bearer headers without full OAuth, which is
   why auth here rides the URL instead.
+- `GET /drop?k=<token>` — the voice drop page (see below).
+- `POST /api/drop?k=<token>` — uploads a voice drop. **Raw request body**
+  (not multipart): the body IS the audio bytes, with `Content-Type` set to
+  the recording's MIME type (e.g. `audio/webm`). Returns `{"url": "..."}`.
+- `GET /drops/<name>` — serves a stored drop. No auth (see below); `<name>`
+  must match `^[A-Za-z0-9_-]+\.(webm|ogg|m4a|mp3|wav)$` or the response is a
+  plain `404`.
+
+## Voice drop page
+
+A tiny, self-contained (no build step, no external resources) browser page
+for recording a voice note on your phone or laptop and getting back a
+shareable link — the flow is **record → get a link → paste the link into a
+claude.ai chat** that has this server's `/mcp` added as a custom connector,
+so `analyze_voice_note` can fetch and analyze it.
+
+Open `https://your-host/drop?k=<your-token>` (same token as `/mcp`). Tap the
+big button to record, tap again to stop; the page uploads the recording to
+`POST /api/drop?k=<your-token>` (the page carries `k` forward from its own
+URL), then shows the resulting link, auto-copies it to your clipboard
+(`navigator.clipboard`, with a visible text box + Copy button fallback when
+that API is unavailable or denied), and gives you a small player to review
+the recording before you share it.
+
+**Auth model:**
+
+- The `/drop` page itself and the `POST /api/drop` upload both require the
+  same `?k=<token>` `/mcp` uses — this is a private page for people who
+  already have your server's token, not a public recorder.
+- The resulting `GET /drops/<name>` links are **not** token-gated, by
+  design — same as a link to a file in any public storage bucket, the link
+  itself (a random 16-byte token in the filename) is the capability.
+  Don't share a drop link anywhere you wouldn't share the recording.
+- Retention is bounded by `ATTUNE_DROPS_KEEP` (default 200): once you have
+  more drops than that, the oldest are deleted automatically after each new
+  one, oldest-first by file modified time.
+
+To let the MCP tool (`analyze_voice_note`) analyze your own drops, add your
+drop URL prefix to `ATTUNE_ALLOWED_AUDIO_PREFIXES`, e.g.
+`https://your-host/drops/` — otherwise the allowlist check in `/mcp` refuses
+it like any other unlisted URL.
 
 ## Security notes
 
 - **Bearer gating.** `/api/analyze` is gated by an ASGI middleware that
   checks the Authorization header *before* reading any request body — an
   unauthenticated request never gets its bytes parsed. `/mcp` checks the `k`
-  query param the same way, before touching the JSON-RPC body.
+  query param the same way, before touching the JSON-RPC body. `POST
+  /api/drop` is gated by the same ASGI middleware, extended to also match
+  this path — it checks `?k=` (not a bearer header, since the drop page's
+  own fetch call and claude.ai's custom connectors can't send one) before
+  a single byte of the upload is streamed to disk. `GET /drops/<name>` is
+  the one deliberate exception — see the Voice drop page section above for
+  why that's by design, not an oversight.
 - **Allowed-origins design, not an open fetch.** The MCP tool only ever
   downloads from URL prefixes you explicitly configure via
   `ATTUNE_ALLOWED_AUDIO_PREFIXES`. With that unset (the default), the tool
@@ -200,7 +267,12 @@ TEMPO : ~92 BPM candidate (low confidence — rubato likely)
 
 - `server.py` — FastAPI wrapper (port defaults to 8452; see Configuration)
 - `singing.py` — pure-numpy singing analysis (melody, vibrato, key, dynamics)
+- `stt_stitch.py` — pure overlap-dedup stitching for chunked webhook STT transcripts (no I/O; see STT modes above)
+- `drop.html` — the self-contained voice drop page served at `GET /drop` (read once at startup, no templating)
+- `drops/` — default storage directory for voice drops (gitignored; see `ATTUNE_DROPS_DIR`)
 - `vendor/seven-ears/` — pinned upstream engine (fetched by `scripts/get-seven-ears.py`)
 - `scripts/get-seven-ears.py` — vendoring/setup script, stdlib only
 - `test_singing.py` — smoke tests for `singing.py`, run directly with no pytest needed
+- `test_stitch.py` — smoke tests for `stt_stitch.py`, run directly with no pytest needed
+- `test_drop_validation.py` — smoke tests for the `/drops/<name>` filename allowlist regex, run directly with no pytest needed
 - `attune.config.example.json` — configuration template

@@ -17,7 +17,14 @@
   "stt_url": "https://your-stt-service.example.com/api/stt",
   "stt_token_file": "~/.attune-stt-token",
   "stt_max_bytes": 6291456,
+  "stt_chunk_seconds": 28,
+  "stt_chunk_overlap_seconds": 2,
+  "stt_max_chunks": 20,
 
   "max_upload_bytes": 52428800,
-  "max_transcript_chars": 16384
+  "max_transcript_chars": 16384,
+
+  "drops_dir": "./drops",
+  "drops_keep": 200,
+  "public_base_url": "https://your-host.example.com"
 }
