@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
+
+# faster-whisper is only needed when ATTUNE_STT_MODE=local (the default).
+# It is a dependency of the vendored seven-ears engine, not of Attune
+# itself -- install it via vendor/seven-ears/requirements.txt after running
+# scripts/get-seven-ears.py:
+#   pip install -r vendor/seven-ears/requirements.txt
+# If you're using ATTUNE_STT_MODE=webhook or =none (e.g. because faster-
+# whisper's DLLs are blocked on your machine), you can skip that install.

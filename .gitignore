@@ -1,0 +1,8 @@
+venv/
+vendor/
+__pycache__/
+*.log
+attune.config.json
+BUILD-LOG.md
+RESEARCH-singing-perception.md
+attune-server.*.log

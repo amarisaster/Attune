@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy this file to attune.config.json (gitignored) and fill in your own values. Every key is optional -- env vars (ATTUNE_*) override these, and unset values fall back to the defaults documented in README.md's Configuration section.",
+
+  "port": 8452,
+
+  "token_file": "~/.attune-token",
+
+  "ffmpeg_dir": "",
+
+  "allowed_audio_prefixes": [
+    "https://your-project.supabase.co/storage/v1/object/public/your-bucket/"
+  ],
+
+  "stt_mode": "local",
+  "whisper_model": "base.en",
+
+  "stt_url": "https://your-stt-service.example.com/api/stt",
+  "stt_token_file": "~/.attune-stt-token",
+  "stt_max_bytes": 6291456,
+
+  "max_upload_bytes": 52428800,
+  "max_transcript_chars": 16384
+}
