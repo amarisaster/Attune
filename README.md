@@ -216,6 +216,29 @@ hallucinates, and a lyrics database is the more honest source for released
 songs. Attune can't know a title from an audio URL, so no `track`/`artist`
 simply means no lyrics section; lookup failures degrade the same way.
 
+**Hearing YouTube links** (recipe): Attune deliberately never fetches
+arbitrary URLs — `analyze_music` only accepts audio from
+`ATTUNE_ALLOWED_AUDIO_PREFIXES`, and that is not going to change. But its
+own drops directory is on that allowlist, so hearing a YouTube track is a
+two-step recipe rather than a server feature:
+
+```
+# 1. Pull the audio down yourself (yt-dlp is pure Python, runs anywhere):
+python -m yt_dlp -x --audio-format mp3 --max-filesize 50M --no-playlist \
+  -o "drops/yt_%(id)s.%(ext)s" "<youtube url>"
+
+# 2. Analyze it via its drops URL (yt-dlp's metadata gives you track/artist
+#    for the lyrics lookup too):
+analyze_music {audio_url: "<public_base_url>/drops/yt_<id>.mp3",
+               mode: "song", track: "...", artist: "..."}
+```
+
+The fetch happens by explicit local action on the machine, not by the
+server accepting a stranger's URL — the no-open-fetch posture stays intact.
+Anything ffmpeg can decode works the same way; YouTube is just the common
+case. Mind the drops retention cap (oldest files beyond `ATTUNE_DROPS_KEEP`
+are pruned) and your local copyright rules.
+
 **Models** (not bundled; `models/` is gitignored): run
 
 ```
