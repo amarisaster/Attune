@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -208,6 +209,7 @@ if CONFIG['ffmpeg_dir']:
 from singing import analyze_singing, format_singing_section, load_wav  # noqa: E402  (after config)
 from stt_stitch import GAP_MARKER, stitch_transcripts  # noqa: E402  (after config)
 from energy_gate import should_skip_stt  # noqa: E402  (after config)
+import music  # noqa: E402  (after config; pure numpy — safe at boot, no model deps)
 
 # ---------------------------------------------------------------------------
 # END CONFIGURATION
@@ -341,6 +343,23 @@ def _local_whisper_available() -> bool:
         return False
 
 
+def _onnxruntime_available() -> bool:
+    try:
+        import onnxruntime  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _music_models_present() -> dict:
+    import basic_pitch_onnx
+    md = basic_pitch_onnx.models_dir()
+    return {
+        'basic_pitch': basic_pitch_onnx.model_path().exists(),
+        'mdx_vocals': (md / 'UVR-MDX-NET-Voc_FT.onnx').exists(),
+    }
+
+
 @app.get('/health')
 async def health():
     body = {
@@ -351,6 +370,10 @@ async def health():
         # from ffmpeg discoverability above) -- False before
         # scripts/get-seven-ears.py has been run.
         'engine_present': SEVEN_EARS_SCRIPT.exists(),
+        # Music perception surface: pure-DSP analysis always works; the
+        # melody/stems models need onnxruntime + scripts/get-models.py.
+        'onnxruntime_available': _onnxruntime_available(),
+        'music_models_present': _music_models_present(),
     }
     if CONFIG['stt_mode'] == 'local':
         # The #1 "why no transcripts?" cause: Install step 3 (the vendor
@@ -395,6 +418,47 @@ async def _run_singing_analysis(tmp_path: str) -> tuple:
     except Exception as e:
         print(f'[attune] singing analysis failed: {e}', file=sys.stderr, flush=True)
         return None, ''
+
+
+def _melody_analysis(tmp_path: str) -> Optional[dict]:
+    """basic-pitch melody summary, or None when the model/runtime is absent.
+    Lazy import — server boot must never depend on onnxruntime loading."""
+    import basic_pitch_onnx
+    ok, reason = basic_pitch_onnx.is_available()
+    if not ok:
+        print(f'[attune] melody skipped: {reason}', file=sys.stderr, flush=True)
+        return None
+    x, sr = load_wav(tmp_path)
+    tr = basic_pitch_onnx.transcribe(x, sr)
+    summary = basic_pitch_onnx.summarize_melody(tr['notes'], len(x) / sr)
+    # measurements carry the compact summary, never the raw polyphonic dump.
+    return summary
+
+
+async def _run_music_analysis(tmp_path: str) -> tuple:
+    """Best-effort music analysis (key/chords/tempo/energy/sections + melody
+    when the basic-pitch model is present) AND its card-section formatting.
+    Same non-fatal posture as _run_singing_analysis: any exception is logged
+    and swallowed — a music-analysis bug must never fail an otherwise-good
+    request. Returns (result_or_None, section_str)."""
+    try:
+        result = await asyncio.to_thread(music.analyze_music, tmp_path)
+    except Exception as e:
+        print(f'[attune] music analysis failed: {e}', file=sys.stderr, flush=True)
+        return None, ''
+    melody = None
+    try:
+        melody = await asyncio.to_thread(_melody_analysis, tmp_path)
+    except Exception as e:
+        print(f'[attune] melody analysis failed: {e}', file=sys.stderr, flush=True)
+    try:
+        if result and melody and melody.get('summary'):
+            result['melody'] = melody
+        section = music.format_music_section(result, melody=melody) if result else ''
+        return result, section
+    except Exception as e:
+        print(f'[attune] music card formatting failed: {e}', file=sys.stderr, flush=True)
+        return result, ''
 
 
 def _render_card(data: dict, script: Optional[Path] = None, timeout: int = 60) -> str:
@@ -861,6 +925,15 @@ async def analyze(
             if section:
                 card_text = f'{card_text}\n{section}' if card_text else section
 
+            # Backing music detected behind the voice? Enrich with the music
+            # card (key/chords/tempo/energy) — best-effort, same posture.
+            if singing and singing.get('analysis_mode') == 'singing-with-music':
+                music_result, music_section = await _run_music_analysis(tmp_path)
+                if music_result:
+                    data['music'] = music_result
+                if music_section:
+                    card_text = f'{card_text}\n{music_section}' if card_text else music_section
+
         return {
             'transcript': data.get('transcript', ''),
             'card_text': card_text,
@@ -1191,6 +1264,270 @@ def _mcp_tool_def() -> dict:
     }
 
 
+MUSIC_MODES = ('auto', 'song', 'instrumental', 'sing_vs_track', 'stems')
+# sing_vs_track and stems run source separation (~minutes on this CPU) —
+# they go through the job store below, never a synchronous MCP response.
+_MUSIC_HEAVY_MODES = ('sing_vs_track', 'stems')
+
+# ── Music job store ─────────────────────────────────────────────────────────
+# Minimal and in-process by design: jobs do NOT survive a server restart
+# (documented in the tool description). One heavy job runs at a time
+# (_HEAVY_SLOT, separate from _ANALYSIS_SLOTS so separation never starves
+# voice notes); one more may queue behind it; a third is refused.
+_HEAVY_SLOT = asyncio.Semaphore(1)
+_JOBS: dict = {}
+_JOBS_MAX = 20
+
+
+def _jobs_evict() -> None:
+    while len(_JOBS) > _JOBS_MAX:
+        done = [jid for jid, j in _JOBS.items() if j['status'] in ('done', 'error')]
+        victim = done[0] if done else next(iter(_JOBS))
+        _JOBS.pop(victim, None)
+
+
+def _run_music_heavy(tmp_path: str, mode: str, filename: str, job: dict) -> str:
+    """Blocking heavy pipeline — runs inside asyncio.to_thread under
+    _HEAVY_SLOT. Returns the finished card text."""
+    import stems as stems_mod
+
+    def prog(frac: float) -> None:
+        # Separation is ~90% of the wall clock; scale it to 0..0.9.
+        job['progress'] = round(0.9 * frac, 3)
+
+    x = stems_mod.load_stereo_44k(tmp_path)
+    separated = stems_mod.separate(x, progress_cb=prog)
+    names = stems_mod.write_stem_wavs(separated, DROPS_DIR)
+    _prune_drops()
+    base_url = (CONFIG['public_base_url'] or '').rstrip('/')
+    if base_url:
+        urls = {k: f'{base_url}/drops/{v}' for k, v in names.items()}
+    else:
+        urls = {k: f'/drops/{v} (no public_base_url configured — relative path)'
+                for k, v in names.items()}
+
+    job['progress'] = 0.92
+    vocal_path = str(DROPS_DIR / names['vocals'])
+    inst_path = str(DROPS_DIR / names['instrumental'])
+
+    parts = [f'{filename} — mode {mode}']
+    if mode == 'stems':
+        # Free value: quick key/tempo of the mix since it's already decoded.
+        try:
+            quick = music.analyze_music(tmp_path)
+            parts.append(music.format_music_section(quick, stems_urls=urls))
+        except Exception as e:
+            print(f'[attune-music-job] quick analysis failed: {e}', file=sys.stderr, flush=True)
+            pairs = '  '.join(f'{k}: {u}' for k, u in urls.items())
+            parts.append(f'STEMS : {pairs} (kept until ~200 newer drops arrive)')
+        return '\n\n'.join(parts)
+
+    # sing_vs_track: her voice on the vocal stem, the music on the rest.
+    singing_result = None
+    try:
+        singing_result = analyze_singing(vocal_path)
+        if singing_result and singing_result.get('is_melodic'):
+            section = format_singing_section(singing_result) or ''
+            if section:
+                parts.append('VOICE (from separated vocal stem):\n' + section)
+        else:
+            parts.append('VOICE: vocal stem held no clear melodic line to analyze')
+    except Exception as e:
+        print(f'[attune-music-job] vocal analysis failed: {e}', file=sys.stderr, flush=True)
+        parts.append('VOICE: vocal stem analysis failed')
+    job['progress'] = 0.96
+
+    music_result = None
+    try:
+        music_result = music.analyze_music(inst_path)
+        melody = None
+        try:
+            melody = _melody_analysis(inst_path)
+        except Exception:
+            pass
+        parts.append(music.format_music_section(music_result, melody=melody, stems_urls=urls))
+    except Exception as e:
+        print(f'[attune-music-job] instrumental analysis failed: {e}', file=sys.stderr, flush=True)
+        parts.append('TRACK: instrumental analysis failed')
+
+    if singing_result and music_result:
+        try:
+            cmp = music.compare_voice_to_track(singing_result, music_result)
+            parts.append(music.format_compare_section(cmp))
+        except Exception as e:
+            print(f'[attune-music-job] compare failed: {e}', file=sys.stderr, flush=True)
+    return '\n\n'.join(parts)
+
+
+async def _music_job_runner(job_id: str, tmp_path: str, mode: str, filename: str) -> None:
+    job = _JOBS[job_id]
+    try:
+        async with _HEAVY_SLOT:
+            job['status'] = 'running'
+            card = await asyncio.to_thread(_run_music_heavy, tmp_path, mode, filename, job)
+            job['card'] = card
+            job['progress'] = 1.0
+            job['status'] = 'done'
+            print(f'[attune-music-job] {job_id} done', file=sys.stderr, flush=True)
+    except Exception as e:
+        job['status'] = 'error'
+        job['error'] = str(e)
+        print(f'[attune-music-job] {job_id} failed: {e}', file=sys.stderr, flush=True)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+
+
+def _start_music_job(tmp_path: str, mode: str, filename: str) -> str:
+    job_id = secrets.token_urlsafe(8)
+    _JOBS[job_id] = {'id': job_id, 'mode': mode, 'status': 'queued',
+                     'progress': 0.0, 'created_at': time.time(),
+                     'card': None, 'error': None, 'file': filename}
+    _jobs_evict()
+    asyncio.get_running_loop().create_task(_music_job_runner(job_id, tmp_path, mode, filename))
+    return job_id
+
+
+def _mcp_music_tool_defs() -> list:
+    prefixes = CONFIG['allowed_audio_prefixes']
+    if prefixes:
+        url_description = 'Public URL starting with one of: ' + ', '.join(prefixes)
+        music_description = (
+            'Music perception: key, tempo + beat confidence, chord progression, '
+            'energy arc and section changes of a track from an allowed storage '
+            'origin. Modes: auto (default), song, instrumental return the card '
+            'immediately; sing_vs_track and stems separate vocals from the music '
+            'first and return a job id to poll with music_job_status (jobs take '
+            'minutes). Numbers with confidence labels, not mood diagnoses.'
+        )
+    else:
+        url_description = 'Not usable until ATTUNE_ALLOWED_AUDIO_PREFIXES is configured on the server.'
+        music_description = (
+            'DISABLED — no ATTUNE_ALLOWED_AUDIO_PREFIXES configured on this server. '
+            'Attune never ships an open fetch-anything endpoint.'
+        )
+    return [
+        {
+            'name': 'analyze_music',
+            'description': music_description,
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'audio_url': {'type': 'string', 'description': url_description},
+                    'mode': {
+                        'type': 'string',
+                        'enum': list(MUSIC_MODES),
+                        'description': (
+                            "auto/song/instrumental: immediate card. sing_vs_track: separate "
+                            "her voice from the backing track and analyze both (job). "
+                            "stems: split vocals/instrumental into files (job)."
+                        ),
+                    },
+                },
+                'required': ['audio_url'],
+            },
+        },
+        {
+            'name': 'music_job_status',
+            'description': (
+                'Check a music analysis job started by analyze_music (sing_vs_track '
+                'or stems mode). Returns progress, or the finished card. Poll no '
+                'more than about once per 30 seconds. Jobs do not survive a server '
+                'restart — an unknown id means resubmit.'
+            ),
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'job_id': {'type': 'string', 'description': 'Job id returned by analyze_music'},
+                },
+                'required': ['job_id'],
+            },
+        },
+    ]
+
+
+async def _mcp_analyze_music(tool_args: dict) -> str:
+    audio_url = str(tool_args.get('audio_url', ''))
+    mode = str(tool_args.get('mode', '') or 'auto').strip().lower()
+    if mode not in MUSIC_MODES:
+        return f"Refused: unknown mode '{mode}'. Modes: {', '.join(MUSIC_MODES)}."
+
+    prefixes = CONFIG['allowed_audio_prefixes']
+    if not prefixes:
+        return ('Refused: this server has no ATTUNE_ALLOWED_AUDIO_PREFIXES configured, so '
+                'music-by-URL analysis is disabled. Attune never ships an open '
+                'fetch-anything endpoint.')
+    url_err = _validate_audio_url(audio_url, prefixes)
+    if url_err:
+        return url_err
+
+    if mode in _MUSIC_HEAVY_MODES:
+        import stems as stems_mod
+        ok, reason = stems_mod.is_available()
+        if not ok:
+            return (f"Mode '{mode}' needs source separation, unavailable here: {reason}. "
+                    'auto/song/instrumental modes are live.')
+        queued = sum(1 for j in _JOBS.values() if j['status'] in ('queued', 'running'))
+        if queued >= 2:
+            return ('A music job is running and one is already queued — try again '
+                    'when the current job finishes (music_job_status shows progress).')
+
+    filename = audio_url.rsplit('/', 1)[-1] or 'track'
+    suffix = Path(filename).suffix or '.mp3'
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = tmp.name
+    tmp.close()
+    owned_by_job = False
+    try:
+        try:
+            await asyncio.to_thread(_fetch_allowed_audio, audio_url, tmp_path)
+        except ValueError as e:
+            print(f'[attune-mcp] music fetch refused: {e}', file=sys.stderr, flush=True)
+            return f'Refused: {e}'
+        except Exception as e:
+            print(f'[attune-mcp] music fetch failed: {e}', file=sys.stderr, flush=True)
+            return 'Could not fetch that audio URL.'
+
+        if mode in _MUSIC_HEAVY_MODES:
+            # The job runner owns (and deletes) the temp file from here on.
+            job_id = _start_music_job(tmp_path, mode, filename)
+            owned_by_job = True
+            return (f'Job started: {job_id} ({mode}, {filename}). Separation takes '
+                    'minutes on this hardware — poll music_job_status no more than '
+                    'about once per 30 seconds. Jobs do not survive a server restart.')
+
+        if _ANALYSIS_SLOTS.locked():
+            return 'Attune is busy analyzing — try again in a moment.'
+        async with _ANALYSIS_SLOTS:
+            print(f'[attune-mcp] music analysis for {filename} (mode={mode})',
+                  file=sys.stderr, flush=True)
+            result, section = await _run_music_analysis(tmp_path)
+        if not result:
+            return 'Music analysis failed.'
+        header = f'{filename} — mode {mode}'
+        return f'{header}\n{section}' if section else f'{header}\n(no analyzable content found)'
+    finally:
+        if not owned_by_job:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+
+
+async def _mcp_music_job_status(tool_args: dict) -> str:
+    job_id = str(tool_args.get('job_id', '')).strip()
+    job = _JOBS.get(job_id)
+    if not job:
+        return (f"Unknown job '{job_id}' — jobs do not survive a server restart. "
+                'Resubmit with analyze_music.')
+    if job['status'] == 'queued':
+        return f"Job {job_id} ({job['mode']}, {job['file']}): queued behind the current job."
+    if job['status'] == 'running':
+        return (f"Job {job_id} ({job['mode']}, {job['file']}): running, "
+                f"{int(job['progress'] * 100)}% done.")
+    if job['status'] == 'error':
+        return f"Job {job_id} failed: {job['error']}"
+    return job['card'] or f'Job {job_id} finished with no card.'
+
+
 async def _mcp_analyze(audio_url: str, transcript: str, language: str = '') -> str:
     prefixes = CONFIG['allowed_audio_prefixes']
     if not prefixes:
@@ -1308,17 +1645,23 @@ async def mcp_post(request: Request):
     if method == 'ping':
         return _rpc_result(req_id, {})
     if method == 'tools/list':
-        return _rpc_result(req_id, {'tools': [_mcp_tool_def()]})
+        return _rpc_result(req_id, {'tools': [_mcp_tool_def()] + _mcp_music_tool_defs()})
     if method == 'tools/call':
         params = msg.get('params') or {}
-        if params.get('name') != 'analyze_voice_note':
-            return _rpc_error(req_id, -32602, 'unknown tool')
+        tool_name = params.get('name')
         tool_args = params.get('arguments') or {}
-        text = await _mcp_analyze(
-            str(tool_args.get('audio_url', '')),
-            str(tool_args.get('transcript', '') or '').strip(),
-            str(tool_args.get('language', '') or '').strip(),
-        )
+        if tool_name == 'analyze_voice_note':
+            text = await _mcp_analyze(
+                str(tool_args.get('audio_url', '')),
+                str(tool_args.get('transcript', '') or '').strip(),
+                str(tool_args.get('language', '') or '').strip(),
+            )
+        elif tool_name == 'analyze_music':
+            text = await _mcp_analyze_music(tool_args)
+        elif tool_name == 'music_job_status':
+            text = await _mcp_music_job_status(tool_args)
+        else:
+            return _rpc_error(req_id, -32602, 'unknown tool')
         return _rpc_result(req_id, {'content': [{'type': 'text', 'text': text}]})
     return _rpc_error(req_id, -32601, f'method not supported: {method}')
 

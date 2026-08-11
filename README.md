@@ -177,6 +177,56 @@ On first boot, a bearer token is generated and written to
   must match `^[A-Za-z0-9_-]+\.(webm|ogg|m4a|mp3|wav)$` or the response is a
   plain `404`.
 
+## Music perception
+
+Attune also hears music, not just voice. Three MCP tools ride the same
+`/mcp` endpoint and token:
+
+- `analyze_music {audio_url, mode}` — key (Krumhansl-Schmuckler over a
+  pure-numpy chromagram), tempo + beat grid with an earned confidence tier,
+  maj/min chord progression, melody line via Spotify's basic-pitch ONNX
+  model, energy arc, and section-change candidates.
+  - Modes `auto` / `song` / `instrumental` return the card immediately
+    (seconds).
+  - Modes `sing_vs_track` and `stems` run MDX-Net source separation first
+    and return a **job id** instead — separation takes minutes on CPU.
+- `music_job_status {job_id}` — progress or the finished card. Jobs are
+  in-process only and **do not survive a server restart**; an unknown id
+  means resubmit.
+- `sing_vs_track` separates vocals from the backing track, runs the singing
+  analysis on the vocal stem and the music analysis on the instrumental,
+  then compares them: in-key fraction, onset timing vs the beat grid,
+  dynamics arcs. `stems` writes `<base>_vocals.wav` / `<base>_instrumental.wav`
+  into `drops/` (they count against the drops retention cap) and returns
+  their URLs.
+
+The honesty rules are the same as everywhere else in Attune: numbers with
+confidence labels, source tags on model-derived lines (`[basic-pitch]`),
+no mood vocabulary, and polyphonic note events are summarized — never
+dumped — because basic-pitch on a full mix emits far more events than any
+one "melody".
+
+**Models** (not bundled; `models/` is gitignored): run
+
+```
+python scripts/get-models.py
+```
+
+which fetches, pinned by SHA256:
+
+- `basic-pitch-nmp.onnx` — Spotify basic-pitch ICASSP-2022 checkpoint
+  (Apache-2.0), melody transcription
+- `UVR-MDX-NET-Voc_FT.onnx` — Ultimate Vocal Remover MDX-Net vocal model
+  (MIT), 2-stem separation (vocals + instrumental; a 4-stem split is a
+  possible follow-up, not pretended)
+
+Both run through `onnxruntime` (CPU provider). If onnxruntime or the model
+files are absent the server still boots and the pure-DSP card (key / tempo /
+chords / energy / sections) keeps working; `GET /health` reports
+`onnxruntime_available` and `music_models_present` so the gap is visible.
+Voice notes that carry backing music (`analysis_mode: singing-with-music`)
+get the MUSIC section appended to `/api/analyze` results automatically.
+
 ## Voice drop page
 
 A tiny, self-contained (no build step, no external resources) browser page
@@ -309,6 +359,13 @@ TEMPO : ~92 BPM candidate (low confidence — rubato likely)
 
 - `server.py` — FastAPI wrapper (port defaults to 8452; see Configuration)
 - `singing.py` — pure-numpy singing analysis (melody, vibrato, key, dynamics)
+- `music.py` — pure-numpy music analysis (chromagram, key, chords, tempo/beat grid, energy, sections)
+- `basic_pitch_onnx.py` — basic-pitch ONNX melody transcription (see Music perception)
+- `stems.py` — MDX-Net ONNX vocal/instrumental separation (see Music perception)
+- `models/` — downloaded ONNX weights (gitignored; fetched by `scripts/get-models.py`)
+- `scripts/get-models.py` — pinned model downloader (SHA256-verified), stdlib only
+- `test_music.py` — smoke tests for `music.py`, run directly with no pytest needed
+- `test_stems.py` — model-dependent tests for stems + melody; SKIPs cleanly when models absent
 - `stt_stitch.py` — pure overlap-dedup stitching for chunked webhook STT transcripts (no I/O; see STT modes above)
 - `energy_gate.py` — pure RMS/voiced-fraction silence gate for webhook STT (no I/O; see STT modes above)
 - `drop.html` — the self-contained voice drop page served at `GET /drop` (read once at startup, no templating)
