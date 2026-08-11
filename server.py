@@ -210,6 +210,7 @@ from singing import analyze_singing, format_singing_section, load_wav  # noqa: E
 from stt_stitch import GAP_MARKER, stitch_transcripts  # noqa: E402  (after config)
 from energy_gate import should_skip_stt  # noqa: E402  (after config)
 import music  # noqa: E402  (after config; pure numpy — safe at boot, no model deps)
+import lyrics as lyrics_mod  # noqa: E402  (stdlib-only; one fixed outbound host, lrclib.net)
 
 # ---------------------------------------------------------------------------
 # END CONFIGURATION
@@ -459,6 +460,25 @@ async def _run_music_analysis(tmp_path: str) -> tuple:
     except Exception as e:
         print(f'[attune] music card formatting failed: {e}', file=sys.stderr, flush=True)
         return result, ''
+
+
+def _lyrics_section(track: str, artist: str, music_result: Optional[dict]) -> str:
+    """Best-effort LRCLIB lyrics section, annotated on the analysis timeline.
+    Blocking (network) — run via asyncio.to_thread. '' on any failure."""
+    try:
+        duration = (music_result or {}).get('duration_s')
+        lyr = lyrics_mod.fetch_lyrics(track, artist, duration)
+        if not lyr:
+            return ''
+        energy = (music_result or {}).get('energy') or {}
+        return lyrics_mod.format_lyrics_section(
+            lyr,
+            peak_t=energy.get('loudest_t'),
+            section_changes=(music_result or {}).get('section_changes'),
+        )
+    except Exception as e:
+        print(f'[attune] lyrics lookup failed: {e}', file=sys.stderr, flush=True)
+        return ''
 
 
 def _render_card(data: dict, script: Optional[Path] = None, timeout: int = 60) -> str:
@@ -1286,7 +1306,8 @@ def _jobs_evict() -> None:
         _JOBS.pop(victim, None)
 
 
-def _run_music_heavy(tmp_path: str, mode: str, filename: str, job: dict) -> str:
+def _run_music_heavy(tmp_path: str, mode: str, filename: str, job: dict,
+                     track: str = '', artist: str = '') -> str:
     """Blocking heavy pipeline — runs inside asyncio.to_thread under
     _HEAVY_SLOT. Returns the finished card text."""
     import stems as stems_mod
@@ -1356,15 +1377,21 @@ def _run_music_heavy(tmp_path: str, mode: str, filename: str, job: dict) -> str:
             parts.append(music.format_compare_section(cmp))
         except Exception as e:
             print(f'[attune-music-job] compare failed: {e}', file=sys.stderr, flush=True)
+    if track and artist:
+        lyr_section = _lyrics_section(track, artist, music_result)
+        if lyr_section:
+            parts.append(lyr_section)
     return '\n\n'.join(parts)
 
 
-async def _music_job_runner(job_id: str, tmp_path: str, mode: str, filename: str) -> None:
+async def _music_job_runner(job_id: str, tmp_path: str, mode: str, filename: str,
+                            track: str = '', artist: str = '') -> None:
     job = _JOBS[job_id]
     try:
         async with _HEAVY_SLOT:
             job['status'] = 'running'
-            card = await asyncio.to_thread(_run_music_heavy, tmp_path, mode, filename, job)
+            card = await asyncio.to_thread(_run_music_heavy, tmp_path, mode, filename, job,
+                                           track, artist)
             job['card'] = card
             job['progress'] = 1.0
             job['status'] = 'done'
@@ -1378,13 +1405,15 @@ async def _music_job_runner(job_id: str, tmp_path: str, mode: str, filename: str
             os.unlink(tmp_path)
 
 
-def _start_music_job(tmp_path: str, mode: str, filename: str) -> str:
+def _start_music_job(tmp_path: str, mode: str, filename: str,
+                     track: str = '', artist: str = '') -> str:
     job_id = secrets.token_urlsafe(8)
     _JOBS[job_id] = {'id': job_id, 'mode': mode, 'status': 'queued',
                      'progress': 0.0, 'created_at': time.time(),
                      'card': None, 'error': None, 'file': filename}
     _jobs_evict()
-    asyncio.get_running_loop().create_task(_music_job_runner(job_id, tmp_path, mode, filename))
+    asyncio.get_running_loop().create_task(
+        _music_job_runner(job_id, tmp_path, mode, filename, track, artist))
     return job_id
 
 
@@ -1423,6 +1452,16 @@ def _mcp_music_tool_defs() -> list:
                             "stems: split vocals/instrumental into files (job)."
                         ),
                     },
+                    'track': {
+                        'type': 'string',
+                        'description': ('Optional song title. With artist, adds a time-synced '
+                                        'LYRICS section from the lrclib database (words are '
+                                        'looked up, never transcribed from the mix).'),
+                    },
+                    'artist': {
+                        'type': 'string',
+                        'description': 'Optional artist name, used with track for the lyrics lookup.',
+                    },
                 },
                 'required': ['audio_url'],
             },
@@ -1449,6 +1488,8 @@ def _mcp_music_tool_defs() -> list:
 async def _mcp_analyze_music(tool_args: dict) -> str:
     audio_url = str(tool_args.get('audio_url', ''))
     mode = str(tool_args.get('mode', '') or 'auto').strip().lower()
+    track = str(tool_args.get('track', '') or '').strip()[:200]
+    artist = str(tool_args.get('artist', '') or '').strip()[:200]
     if mode not in MUSIC_MODES:
         return f"Refused: unknown mode '{mode}'. Modes: {', '.join(MUSIC_MODES)}."
 
@@ -1490,7 +1531,7 @@ async def _mcp_analyze_music(tool_args: dict) -> str:
 
         if mode in _MUSIC_HEAVY_MODES:
             # The job runner owns (and deletes) the temp file from here on.
-            job_id = _start_music_job(tmp_path, mode, filename)
+            job_id = _start_music_job(tmp_path, mode, filename, track, artist)
             owned_by_job = True
             return (f'Job started: {job_id} ({mode}, {filename}). Separation takes '
                     'minutes on this hardware — poll music_job_status no more than '
@@ -1504,6 +1545,10 @@ async def _mcp_analyze_music(tool_args: dict) -> str:
             result, section = await _run_music_analysis(tmp_path)
         if not result:
             return 'Music analysis failed.'
+        if track and artist:
+            lyr_section = await asyncio.to_thread(_lyrics_section, track, artist, result)
+            if lyr_section:
+                section = f'{section}\n{lyr_section}' if section else lyr_section
         header = f'{filename} — mode {mode}'
         return f'{header}\n{section}' if section else f'{header}\n(no analyzable content found)'
     finally:

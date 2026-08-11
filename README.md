@@ -206,6 +206,16 @@ no mood vocabulary, and polyphonic note events are summarized — never
 dumped — because basic-pitch on a full mix emits far more events than any
 one "melody".
 
+**Lyrics** (`lyrics.py`): pass optional `track` + `artist` to `analyze_music`
+and the card gains a `LYRICS` section from the LRCLIB database
+(https://lrclib.net — public, keyless; the one fixed outbound host this
+feature talks to). Synced lines are rendered on the same timeline as the
+analysis, with the energy peak and section changes annotated inline. Words
+are *looked up*, never transcribed from the mix — STT over a full mix
+hallucinates, and a lyrics database is the more honest source for released
+songs. Attune can't know a title from an audio URL, so no `track`/`artist`
+simply means no lyrics section; lookup failures degrade the same way.
+
 **Models** (not bundled; `models/` is gitignored): run
 
 ```
@@ -360,6 +370,8 @@ TEMPO : ~92 BPM candidate (low confidence — rubato likely)
 - `server.py` — FastAPI wrapper (port defaults to 8452; see Configuration)
 - `singing.py` — pure-numpy singing analysis (melody, vibrato, key, dynamics)
 - `music.py` — pure-numpy music analysis (chromagram, key, chords, tempo/beat grid, energy, sections)
+- `lyrics.py` — LRCLIB lyrics lookup + LRC parsing (stdlib only; see Music perception)
+- `test_lyrics.py` — offline tests for LRC parsing/rendering, run directly with no pytest needed
 - `basic_pitch_onnx.py` — basic-pitch ONNX melody transcription (see Music perception)
 - `stems.py` — MDX-Net ONNX vocal/instrumental separation (see Music perception)
 - `models/` — downloaded ONNX weights (gitignored; fetched by `scripts/get-models.py`)
