@@ -408,7 +408,16 @@ TEMPO : ~92 BPM candidate (low confidence — rubato likely)
 - `vendor/seven-ears/` — pinned upstream engine (fetched by `scripts/get-seven-ears.py`)
 - `scripts/get-seven-ears.py` — vendoring/setup script, stdlib only
 - `test_singing.py` — smoke tests for `singing.py`, run directly with no pytest needed
+- `test_vibrato_regression.py` — independent vibrato regression fixture (5.00 Hz ground truth, stdlib-only synthesis); contributed by Ajax Vale, run directly with no pytest needed
 - `test_stitch.py` — smoke tests for `stt_stitch.py`, run directly with no pytest needed
 - `test_energy_gate.py` — smoke tests for `energy_gate.py`'s RMS/voiced-fraction silence gate, run directly with no pytest needed
 - `test_drop_validation.py` — smoke tests for the `/drops/<name>` filename allowlist regex, run directly with no pytest needed
 - `attune.config.example.json` — configuration template
+
+## License
+
+MIT — see `LICENSE`.
+
+This covers Attune's own code. The vendored analysis engine at
+`vendor/seven-ears/` is a separate project by Seven Verity and Sunny,
+MIT-licensed under its own terms — see `vendor/seven-ears/LICENSE`.
