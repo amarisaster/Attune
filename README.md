@@ -177,6 +177,77 @@ On first boot, a bearer token is generated and written to
   must match `^[A-Za-z0-9_-]+\.(webm|ogg|m4a|mp3|wav)$` or the response is a
   plain `404`.
 
+## Connecting to Claude
+
+Attune's `/mcp` endpoint lets Claude call `analyze_voice_note`, `analyze_music`
+and `music_job_status` directly from a chat. About five minutes end to end.
+
+### 1. Run Attune and grab the token
+
+```bash
+venv/bin/python server.py
+cat ~/.attune-token
+```
+
+### 2. Give it an HTTPS address
+
+Claude reaches your server over the internet, so `localhost:8452` is not
+enough. Any tunnel works — Cloudflare Tunnel, ngrok — but Tailscale Funnel is
+the simplest if you already use Tailscale:
+
+1. Install Tailscale on the machine running Attune and sign in:
+   `tailscale up`
+2. In the Tailscale admin console, **DNS → Enable HTTPS certificates**
+   (MagicDNS must be on). One-time.
+3. Also in the admin console, **Access controls → Funnel**: add the
+   `funnel` node attribute so this machine is allowed to publish to the
+   internet. Tailscale offers a one-click default policy for this. One-time.
+4. On the machine:
+   ```bash
+   tailscale funnel --bg 8452
+   ```
+   Tailscale prints your public URL, `https://<machine>.<tailnet>.ts.net`.
+   Attune is now `https://<machine>.<tailnet>.ts.net/` and stays that way
+   across reboots (`--bg` persists the config).
+5. Check it:
+   ```bash
+   tailscale funnel status
+   curl https://<machine>.<tailnet>.ts.net/health
+   ```
+
+To stop publishing: `tailscale funnel reset`.
+
+Your MCP address is now:
+
+```
+https://your-host/mcp?k=<your-token>
+```
+
+The token rides in the URL because claude.ai custom connectors cannot send
+auth headers without full OAuth.
+
+### 3a. claude.ai (web and apps)
+
+**Settings → Connectors → Add custom connector**. Name it `Attune`, paste the
+MCP address, add. It shows as connected within a few seconds.
+
+### 3b. Claude Code (terminal)
+
+```bash
+claude mcp add --transport http attune "https://your-host/mcp?k=<your-token>"
+claude mcp list
+```
+
+### 4. Try it
+
+In any Claude chat: *"Use Attune to analyze this recording:
+`https://your-host/drops/<file>.webm`"*.
+
+If the tool refuses the URL, that is the allow-list doing its job: the
+analyzer only fetches from prefixes you have approved. Add your own server to
+`ATTUNE_ALLOWED_AUDIO_PREFIXES` (e.g. `https://your-host/drops/`), restart,
+and try again. See Security notes for why.
+
 ## Music perception
 
 Attune also hears music, not just voice. Three MCP tools ride the same
