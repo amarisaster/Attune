@@ -7,6 +7,7 @@ at all (acoustics-only) — see the CONFIGURATION section below and README.md.
 """
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -165,6 +166,16 @@ CONFIG = {
     # reverse proxy / tunnel that terminates TLS or rewrites Host, so
     # returned drop links match the externally reachable origin.
     'public_base_url': _cfg_str('ATTUNE_PUBLIC_BASE_URL', 'public_base_url', ''),
+    # Sequential first-listen storage. The MCP uses one server-configured
+    # namespace because Attune authentication is one shared bearer token, not
+    # an account/identity system.
+    'encounter_db': Path(_cfg_str(
+        'ATTUNE_ENCOUNTER_DB', 'encounter_db',
+        str(Path.home() / '.attune' / 'encounters.sqlite'),
+    )).expanduser(),
+    'encounter_listener_id': _cfg_str(
+        'ATTUNE_ENCOUNTER_LISTENER_ID', 'encounter_listener_id', 'default-listener'
+    ),
 }
 
 if CONFIG['stt_mode'] not in ('local', 'webhook', 'none'):
@@ -209,6 +220,7 @@ if CONFIG['ffmpeg_dir']:
 from singing import analyze_singing, format_singing_section, load_wav  # noqa: E402  (after config)
 from stt_stitch import GAP_MARKER, stitch_transcripts  # noqa: E402  (after config)
 from energy_gate import should_skip_stt  # noqa: E402  (after config)
+from voice_delivery import analyze_voice_delivery, format_voice_delivery_section  # noqa: E402
 import music  # noqa: E402  (after config; pure numpy — safe at boot, no model deps)
 import lyrics as lyrics_mod  # noqa: E402  (stdlib-only; one fixed outbound host, lrclib.net)
 
@@ -418,6 +430,16 @@ async def _run_singing_analysis(tmp_path: str) -> tuple:
         return result, section
     except Exception as e:
         print(f'[attune] singing analysis failed: {e}', file=sys.stderr, flush=True)
+        return None, ''
+
+
+async def _run_voice_delivery(tmp_path: str, data: dict) -> tuple:
+    """Best-effort spoken delivery/texture description for voice notes."""
+    try:
+        result = await asyncio.to_thread(analyze_voice_delivery, tmp_path, data)
+        return result, format_voice_delivery_section(result)
+    except Exception as e:
+        print(f'[attune] voice delivery analysis failed: {e}', file=sys.stderr, flush=True)
         return None, ''
 
 
@@ -939,6 +961,12 @@ async def analyze(
                 data['stt_partial'] = True
             card_text = await asyncio.to_thread(_render_card, data)
 
+            voice_delivery, voice_section = await _run_voice_delivery(tmp_path, data)
+            if voice_delivery:
+                data['voice_delivery'] = voice_delivery
+            if voice_section:
+                card_text = f'{card_text}\n{voice_section}' if card_text else voice_section
+
             singing, section = await _run_singing_analysis(tmp_path)
             if singing and singing.get('is_melodic'):
                 data['singing'] = singing
@@ -958,6 +986,54 @@ async def analyze(
             'transcript': data.get('transcript', ''),
             'card_text': card_text,
             'measurements': data,
+        }
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.close()
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+
+
+@app.post('/api/transcribe')
+async def transcribe(
+    request: Request,
+    audio: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Transcribe a voice note without running the full acoustic analyzer."""
+    _check_auth(authorization)
+
+    cl = request.headers.get('content-length')
+    if cl is not None and cl.isdigit() and int(cl) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f'audio exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MiB limit')
+
+    filename = audio.filename or 'voice-note'
+    suffix = Path(filename).suffix
+    if not suffix:
+        suffix = _SUFFIX_BY_CONTENT_TYPE.get(audio.content_type or '', '.webm')
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = tmp.name
+    try:
+        total = 0
+        while chunk := await audio.read(1 << 20):
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, f'audio exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MiB limit')
+            await asyncio.to_thread(tmp.write, chunk)
+        tmp.close()
+
+        if _ANALYSIS_SLOTS.locked():
+            raise HTTPException(429, 'transcription busy, retry shortly')
+        async with _ANALYSIS_SLOTS:
+            text, _extra_args, skipped, partial = await _resolve_stt(
+                tmp_path, '', (language or '').strip(),
+            )
+        return {
+            'transcript': text,
+            'stt_skipped': skipped,
+            'stt_partial': partial,
         }
     finally:
         with contextlib.suppress(OSError):
@@ -1251,7 +1327,8 @@ def _mcp_tool_def() -> dict:
         description = (
             'Acoustic analysis of a voice note from an allowed storage origin. '
             'Give it the public audio URL (and optionally the transcript) and it returns '
-            'the Attune acoustic card: timing, pauses, pace, pitch, dynamics. '
+            'the Attune acoustic card: timing, pauses, pace, pitch, dynamics, and an '
+            'evidence-bound plain-language description of vocal delivery and texture. '
             'Numbers, not diagnoses — cues support interpretation in context.'
         )
         url_description = 'Public URL starting with one of: ' + ', '.join(prefixes)
@@ -1295,6 +1372,7 @@ _MUSIC_HEAVY_MODES = ('sing_vs_track', 'stems')
 # (_HEAVY_SLOT, separate from _ANALYSIS_SLOTS so separation never starves
 # voice notes); one more may queue behind it; a third is refused.
 _HEAVY_SLOT = asyncio.Semaphore(1)
+_ENCOUNTER_SLOT = asyncio.Semaphore(1)
 _JOBS: dict = {}
 _JOBS_MAX = 20
 
@@ -1443,6 +1521,11 @@ def _mcp_music_tool_defs() -> list:
                 'type': 'object',
                 'properties': {
                     'audio_url': {'type': 'string', 'description': url_description},
+                    'youtube_url': {
+                        'type': 'string',
+                        'description': ('A youtube.com, music.youtube.com, or youtu.be URL. '
+                                        'Attune downloads it locally before analysis.'),
+                    },
                     'mode': {
                         'type': 'string',
                         'enum': list(MUSIC_MODES),
@@ -1463,7 +1546,6 @@ def _mcp_music_tool_defs() -> list:
                         'description': 'Optional artist name, used with track for the lyrics lookup.',
                     },
                 },
-                'required': ['audio_url'],
             },
         },
         {
@@ -1487,20 +1569,35 @@ def _mcp_music_tool_defs() -> list:
 
 async def _mcp_analyze_music(tool_args: dict) -> str:
     audio_url = str(tool_args.get('audio_url', ''))
+    youtube_url = str(tool_args.get('youtube_url', '')).strip()
     mode = str(tool_args.get('mode', '') or 'auto').strip().lower()
     track = str(tool_args.get('track', '') or '').strip()[:200]
     artist = str(tool_args.get('artist', '') or '').strip()[:200]
     if mode not in MUSIC_MODES:
         return f"Refused: unknown mode '{mode}'. Modes: {', '.join(MUSIC_MODES)}."
 
-    prefixes = CONFIG['allowed_audio_prefixes']
-    if not prefixes:
-        return ('Refused: this server has no ATTUNE_ALLOWED_AUDIO_PREFIXES configured, so '
-                'music-by-URL analysis is disabled. Attune never ships an open '
-                'fetch-anything endpoint.')
-    url_err = _validate_audio_url(audio_url, prefixes)
-    if url_err:
-        return url_err
+    if bool(audio_url) == bool(youtube_url):
+        return 'Refused: provide exactly one of audio_url or youtube_url.'
+
+    if youtube_url:
+        try:
+            parsed = urllib.parse.urlsplit(youtube_url)
+            host = (parsed.hostname or '').lower().rstrip('.')
+            allowed_hosts = {'youtube.com', 'www.youtube.com', 'music.youtube.com', 'youtu.be'}
+            if (parsed.scheme != 'https' or host not in allowed_hosts or parsed.username
+                    or parsed.password or parsed.port not in (None, 443)):
+                return 'Refused: youtube_url must be an HTTPS YouTube watch URL.'
+        except (ValueError, UnicodeError):
+            return 'Refused: invalid youtube_url.'
+    else:
+        prefixes = CONFIG['allowed_audio_prefixes']
+        if not prefixes:
+            return ('Refused: this server has no ATTUNE_ALLOWED_AUDIO_PREFIXES configured, so '
+                    'music-by-URL analysis is disabled. Attune never ships an open '
+                    'fetch-anything endpoint.')
+        url_err = _validate_audio_url(audio_url, prefixes)
+        if url_err:
+            return url_err
 
     if mode in _MUSIC_HEAVY_MODES:
         import stems as stems_mod
@@ -1513,15 +1610,32 @@ async def _mcp_analyze_music(tool_args: dict) -> str:
             return ('A music job is running and one is already queued — try again '
                     'when the current job finishes (music_job_status shows progress).')
 
-    filename = audio_url.rsplit('/', 1)[-1] or 'track'
-    suffix = Path(filename).suffix or '.mp3'
+    filename = 'youtube-track.mp3' if youtube_url else (audio_url.rsplit('/', 1)[-1] or 'track')
+    suffix = '.mp3' if youtube_url else (Path(filename).suffix or '.mp3')
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp_path = tmp.name
     tmp.close()
     owned_by_job = False
     try:
         try:
-            await asyncio.to_thread(_fetch_allowed_audio, audio_url, tmp_path)
+            if youtube_url:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                command = [
+                    sys.executable, '-m', 'yt_dlp', '--no-playlist',
+                    '--js-runtimes', 'node:/usr/bin/node',
+                    '--max-filesize', '50M', '-x', '--audio-format', 'mp3',
+                    '--audio-quality', '160K', '--force-overwrites',
+                    '-o', tmp_path, youtube_url,
+                ]
+                completed = await asyncio.to_thread(
+                    subprocess.run, command, capture_output=True, text=True, timeout=180,
+                )
+                if completed.returncode != 0 or not os.path.exists(tmp_path):
+                    detail = (completed.stderr or '')[-500:]
+                    raise RuntimeError(f'yt-dlp failed: {detail}')
+            else:
+                await asyncio.to_thread(_fetch_allowed_audio, audio_url, tmp_path)
         except ValueError as e:
             print(f'[attune-mcp] music fetch refused: {e}', file=sys.stderr, flush=True)
             return f'Refused: {e}'
@@ -1571,6 +1685,142 @@ async def _mcp_music_job_status(tool_args: dict) -> str:
     if job['status'] == 'error':
         return f"Job {job_id} failed: {job['error']}"
     return job['card'] or f'Job {job_id} finished with no card.'
+
+
+def _mcp_encounter_tool_defs() -> list:
+    return [
+        {
+            'name': 'music_prepare_encounter',
+            'description': (
+                'Prepare one blind sequential first-listen encounter from an HTTPS '
+                'YouTube or YouTube Music video. Identity, total duration, passage '
+                'count, and future evidence stay hidden until listening is complete.'
+            ),
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'youtube_url': {'type': 'string', 'format': 'uri'},
+                    'mode': {'type': 'string', 'enum': ['adaptive', 'fixed'], 'default': 'adaptive'},
+                },
+                'required': ['youtube_url'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'music_next_passage',
+            'description': (
+                'Receive or replay the current unlocked audio passage with only its '
+                'causal measurements and provenance-labelled timed lyrics.'
+            ),
+            'inputSchema': {
+                'type': 'object',
+                'properties': {'session_id': {'type': 'string'}},
+                'required': ['session_id'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'music_record_impression',
+            'description': 'Save the immutable first impression for the current passage.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'session_id': {'type': 'string'},
+                    'passage_token': {'type': 'string'},
+                    'impression': {'type': 'string'},
+                },
+                'required': ['session_id', 'passage_token', 'impression'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'music_finish_encounter',
+            'description': (
+                'After every passage has an impression, reveal the recording identity '
+                'and complete immutable first-listen journal.'
+            ),
+            'inputSchema': {
+                'type': 'object',
+                'properties': {'session_id': {'type': 'string'}},
+                'required': ['session_id'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'music_store_retrospective',
+            'description': 'Store one separate immutable post-reveal interpretation.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'session_id': {'type': 'string'},
+                    'retrospective': {'type': 'string'},
+                    'salience': {'type': 'number', 'minimum': 0, 'maximum': 10, 'default': 7},
+                },
+                'required': ['session_id', 'retrospective'],
+                'additionalProperties': False,
+            },
+        },
+    ]
+
+
+async def _mcp_encounter_call(tool_name: str, tool_args: dict):
+    from attune_encounter import (
+        EncounterError,
+        finish_encounter,
+        next_passage,
+        passage_audio,
+        prepare_youtube_encounter,
+        record_impression,
+        store_retrospective,
+    )
+
+    db_path = CONFIG['encounter_db']
+    listener_id = CONFIG['encounter_listener_id']
+    try:
+        if tool_name == 'music_prepare_encounter':
+            if _ENCOUNTER_SLOT.locked():
+                return {'error': 'encounter preparation is busy; retry shortly'}, None
+            async with _ENCOUNTER_SLOT:
+                result = await asyncio.to_thread(
+                    prepare_youtube_encounter,
+                    db_path,
+                    str(tool_args.get('youtube_url') or ''),
+                    listener_id,
+                    mode=str(tool_args.get('mode') or 'adaptive'),
+                )
+            return result, None
+        session_id = str(tool_args.get('session_id') or '')
+        if tool_name == 'music_next_passage':
+            packet = await asyncio.to_thread(next_passage, db_path, session_id, listener_id)
+            if packet.get('complete'):
+                return packet, None
+            data, mime_type, digest = await asyncio.to_thread(
+                passage_audio, db_path, session_id, listener_id, packet['passage_id']
+            )
+            packet['audio'] = {'mime_type': mime_type, 'sha256': digest, 'attached': True}
+            return packet, (data, mime_type)
+        if tool_name == 'music_record_impression':
+            return await asyncio.to_thread(
+                record_impression, db_path, session_id, listener_id,
+                str(tool_args.get('passage_token') or ''),
+                str(tool_args.get('impression') or ''),
+            ), None
+        if tool_name == 'music_finish_encounter':
+            return await asyncio.to_thread(
+                finish_encounter, db_path, session_id, listener_id
+            ), None
+        if tool_name == 'music_store_retrospective':
+            return await asyncio.to_thread(
+                store_retrospective, db_path, session_id, listener_id,
+                str(tool_args.get('retrospective') or ''),
+                salience=tool_args.get('salience', 7),
+            ), None
+    except EncounterError as exc:
+        return {'error': str(exc)}, None
+    except Exception as exc:
+        print(f'[attune-encounter] operation failed: {type(exc).__name__}', file=sys.stderr, flush=True)
+        return {'error': 'operation failed'}, None
+    return {'error': 'unknown encounter tool'}, None
 
 
 async def _mcp_analyze(audio_url: str, transcript: str, language: str = '') -> str:
@@ -1628,6 +1878,12 @@ async def _mcp_analyze(audio_url: str, transcript: str, language: str = '') -> s
             data['file'] = filename
             card = await asyncio.to_thread(_render_card, data)
 
+            voice_delivery, voice_section = await _run_voice_delivery(tmp_path, data)
+            if voice_delivery:
+                data['voice_delivery'] = voice_delivery
+            if voice_section:
+                card = f'{card}\n{voice_section}' if card else voice_section
+
             singing, mcp_section = await _run_singing_analysis(tmp_path)
             if singing and singing.get('is_melodic'):
                 data['singing'] = singing
@@ -1683,18 +1939,21 @@ async def mcp_post(request: Request):
         return _rpc_result(req_id, {
             'protocolVersion': client_ver,
             'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'attune', 'version': '1.0.0'},
+            'serverInfo': {'name': 'attune', 'version': '1.1.0'},
         })
     if method.startswith('notifications/'):
         return Response(status_code=202)
     if method == 'ping':
         return _rpc_result(req_id, {})
     if method == 'tools/list':
-        return _rpc_result(req_id, {'tools': [_mcp_tool_def()] + _mcp_music_tool_defs()})
+        return _rpc_result(req_id, {
+            'tools': [_mcp_tool_def()] + _mcp_music_tool_defs() + _mcp_encounter_tool_defs()
+        })
     if method == 'tools/call':
         params = msg.get('params') or {}
         tool_name = params.get('name')
         tool_args = params.get('arguments') or {}
+        audio = None
         if tool_name == 'analyze_voice_note':
             text = await _mcp_analyze(
                 str(tool_args.get('audio_url', '')),
@@ -1705,9 +1964,20 @@ async def mcp_post(request: Request):
             text = await _mcp_analyze_music(tool_args)
         elif tool_name == 'music_job_status':
             text = await _mcp_music_job_status(tool_args)
+        elif tool_name in {tool['name'] for tool in _mcp_encounter_tool_defs()}:
+            result, audio = await _mcp_encounter_call(tool_name, tool_args)
+            text = json.dumps(result, ensure_ascii=False, allow_nan=False)
         else:
             return _rpc_error(req_id, -32602, 'unknown tool')
-        return _rpc_result(req_id, {'content': [{'type': 'text', 'text': text}]})
+        content = [{'type': 'text', 'text': text}]
+        if audio is not None:
+            data, mime_type = audio
+            content.insert(0, {
+                'type': 'audio',
+                'data': base64.b64encode(data).decode('ascii'),
+                'mimeType': mime_type,
+            })
+        return _rpc_result(req_id, {'content': content})
     return _rpc_error(req_id, -32601, f'method not supported: {method}')
 
 

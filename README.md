@@ -4,6 +4,10 @@ A voice-note analysis service. Receives a recorded voice note and returns:
 
 - **Acoustic measurements** — timing, pauses, pace, pitch, dynamics (via the
   vendored [seven-ears](https://github.com/meatwife/seven-ears) engine)
+- **Voice delivery** — a plain-language summary of measured pace, pitch
+  movement, brightness, dynamics, pauses, and cautious texture indicators
+  (clear/tonal, airy/noisy, or rough/irregular). Recording conditions can
+  affect texture; these descriptions never assert emotion or intent.
 - **Singing analysis** — melody notes, glides/slides, vibrato, a dynamics
   arc, and a key guess, when the clip is melodic (via `singing.py`, a
   pure-numpy addition on top of seven-ears)
@@ -22,6 +26,64 @@ by **Seven Verity** (AI companion) and **Sunny** (MIT license), vendored
 unmodified at `vendor/seven-ears/` and pinned to commit `d33e7c1`. Attune is
 only the thin HTTP wrapper around it, plus the singing-analysis addition.
 Thank you both — this tool's ethics are as good as its measurements.
+
+Attune's sequential first-listen work was informed at the behavior level by
+[Music for Machine Ears](https://github.com/v3nommy/Music-for-Machine-Ears),
+[Escutário](https://github.com/SolanceLab/escutario), and the later
+[seven-ears First Listen](https://github.com/meatwife/seven-ears/blob/main/docs/FIRST_LISTEN.md)
+design. Attune's implementation is original; no code, prompts, schemas, tests,
+or UI from those research projects were copied. See [PROVENANCE.md](PROVENANCE.md)
+for exact revisions, dependency roles, and implementation boundaries.
+
+## Sequential first-listen encounters
+
+The `attune_encounter` package turns one recording into an ordered listening
+encounter rather than a whole-song summary:
+
+- fixed 60-second passages, or causal adaptive passages between 45 and 90 seconds;
+- identity, total duration, passage count, and future evidence remain hidden
+  until every passage has an immutable first impression;
+- only current-passage lyrics and measurements are revealed;
+- synchronized lyrics preserve provenance and distinguish verified LRCLIB
+  lyrics, creator captions, automatic captions, and unavailable lyrics;
+- passage-local spectral balance, pitch-class color, transient activity, and
+  supported local pulse are measured without normalizing against the future;
+- optional source-separated vocal evidence reports measured pitch movement,
+  held notes, glides, vibrato, dynamics, and cautious texture indicators;
+- SQLite state, opaque passage tokens, exact-retry idempotency, immutable
+  retrospectives, and a durable callback-driven journal outbox survive restarts.
+
+The engine is provider-independent. A listener namespace can represent a
+person, agent, application profile, or test fixture. Storage adapters and
+remote transports stay outside the engine; no household identity or endpoint
+is built into it.
+
+Minimal Python use:
+
+```python
+from pathlib import Path
+from attune_encounter import prepare_encounter, next_passage, record_impression
+
+ready = prepare_encounter(
+    Path("private/encounters.sqlite"),
+    Path("private/recording.mp3"),
+    "listener-one",
+    {"title": "Track", "artist": "Artist"},
+    {"verified": False, "verification": "unavailable",
+     "source": "No timed lyrics available", "lines": []},
+    mode="adaptive",
+)
+packet = next_passage(Path("private/encounters.sqlite"), ready["session_id"], "listener-one")
+record_impression(
+    Path("private/encounters.sqlite"), ready["session_id"], "listener-one",
+    packet["token"], "My first-pass reading of this passage.",
+)
+```
+
+The database directory must be private (`0700`) and the database is forced to
+`0600`. Set `ATTUNE_ENCOUNTER_VOCAL_ANALYSIS=true` to enable the heavier vocal
+stem worker. Runtime preparation requires `ffmpeg` and `ffprobe`; YouTube
+imports additionally require `yt-dlp`.
 
 ## Install
 
@@ -79,6 +141,8 @@ default, without consulting the JSON file either.
 | `ATTUNE_DROPS_DIR` | `drops_dir` | `./drops` | Directory where voice drops are stored (relative paths resolve next to `server.py`, not the process cwd). Created on boot |
 | `ATTUNE_DROPS_KEEP` | `drops_keep` | `200` | How many drops to retain; after each new drop, the oldest files beyond this count are deleted (mtime sort), with each deletion logged |
 | `ATTUNE_PUBLIC_BASE_URL` | `public_base_url` | *(unset)* | Public origin used to build the `url` returned by `POST /api/drop`, e.g. `https://your-host`. When unset, derived from the request's `Host` header — set this explicitly if Attune sits behind a reverse proxy/tunnel that terminates TLS or rewrites `Host` |
+| `ATTUNE_ENCOUNTER_DB` | `encounter_db` | `~/.attune/encounters.sqlite` | Private SQLite state for sequential first-listen encounters |
+| `ATTUNE_ENCOUNTER_LISTENER_ID` | `encounter_listener_id` | `default-listener` | One server-owned listener namespace used by the shared-token MCP |
 
 **STT modes**, when the caller doesn't already supply a transcript:
 
@@ -179,8 +243,8 @@ On first boot, a bearer token is generated and written to
 
 ## Connecting to Claude
 
-Attune's `/mcp` endpoint lets Claude call `analyze_voice_note`, `analyze_music`
-and `music_job_status` directly from a chat. About five minutes end to end.
+Attune's `/mcp` endpoint lets compatible clients call the voice, whole-track,
+and sequential-listening tools directly from a chat.
 
 ### 1. Run Attune and grab the token
 
@@ -287,11 +351,14 @@ hallucinates, and a lyrics database is the more honest source for released
 songs. Attune can't know a title from an audio URL, so no `track`/`artist`
 simply means no lyrics section; lookup failures degrade the same way.
 
-**Hearing YouTube links** (recipe): Attune deliberately never fetches
-arbitrary URLs — `analyze_music` only accepts audio from
-`ATTUNE_ALLOWED_AUDIO_PREFIXES`, and that is not going to change. But its
-own drops directory is on that allowlist, so hearing a YouTube track is a
-two-step recipe rather than a server feature:
+**Hearing YouTube links:** both `analyze_music` and
+`music_prepare_encounter` accept one validated HTTPS YouTube or YouTube Music
+video. Imports use `yt-dlp`, reject playlists and credentials, apply duration
+and byte bounds, and delete transient source audio after processing. Ordinary
+`audio_url` inputs remain restricted to `ATTUNE_ALLOWED_AUDIO_PREFIXES`.
+
+If a deployment disables direct YouTube import, the equivalent explicit local
+recipe is:
 
 ```
 # 1. Pull the audio down yourself (yt-dlp is pure Python, runs anywhere):
@@ -304,11 +371,27 @@ analyze_music {audio_url: "<public_base_url>/drops/yt_<id>.mp3",
                mode: "song", track: "...", artist: "..."}
 ```
 
-The fetch happens by explicit local action on the machine, not by the
-server accepting a stranger's URL — the no-open-fetch posture stays intact.
-Anything ffmpeg can decode works the same way; YouTube is just the common
-case. Mind the drops retention cap (oldest files beyond `ATTUNE_DROPS_KEEP`
-are pruned) and your local copyright rules.
+Anything ffmpeg can decode works through the allowlisted-audio path. Mind the
+drops retention cap (oldest files beyond `ATTUNE_DROPS_KEEP` are pruned) and
+your local copyright rules.
+
+**Sequential encounter MCP tools:**
+
+- `music_prepare_encounter {youtube_url, mode}` prepares a blind encounter;
+- `music_next_passage {session_id}` attaches the current passage audio and
+  returns only current causal evidence and timed lyrics;
+- `music_record_impression {session_id, passage_token, impression}` saves the
+  immutable first reading before the next passage unlocks;
+- `music_finish_encounter {session_id}` reveals the identity and complete
+  first-listen journal after every passage is recorded;
+- `music_store_retrospective {session_id, retrospective, salience}` stores a
+  separate immutable post-reveal reading.
+
+The shared MCP bearer token maps to the one configured
+`ATTUNE_ENCOUNTER_LISTENER_ID`; callers cannot choose another namespace in a
+tool request. The public server keeps journal export generic. A deployer can
+use `sync_journal_outbox` with their own callback to map records into any
+memory or journal system.
 
 **Models** (not bundled; `models/` is gitignored): run
 
@@ -377,6 +460,10 @@ it like any other unlisted URL.
   a single byte of the upload is streamed to disk. `GET /drops/<name>` is
   the one deliberate exception — see the Voice drop page section above for
   why that's by design, not an oversight.
+- **One encounter namespace per server token.** Sequential encounter tools do
+  not accept a caller-provided listener ID. Every holder of the shared token
+  reaches the server-configured namespace, so use separate deployments or
+  separate tokens/servers when listeners must be isolated from one another.
 - **Allowed-origins design, not an open fetch.** The MCP tool only ever
   downloads from URL prefixes you explicitly configure via
   `ATTUNE_ALLOWED_AUDIO_PREFIXES`. With that unset (the default), the tool
@@ -462,6 +549,8 @@ TEMPO : ~92 BPM candidate (low confidence — rubato likely)
 ## Layout
 
 - `server.py` — FastAPI wrapper (port defaults to 8452; see Configuration)
+- `attune_encounter/` — causal sequential-listening engine, YouTube importer,
+  passage-local organs, and optional vocal worker
 - `singing.py` — pure-numpy singing analysis (melody, vibrato, key, dynamics)
 - `music.py` — pure-numpy music analysis (chromagram, key, chords, tempo/beat grid, energy, sections)
 - `lyrics.py` — LRCLIB lyrics lookup + LRC parsing (stdlib only; see Music perception)

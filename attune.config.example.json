@@ -27,5 +27,8 @@
 
   "drops_dir": "./drops",
   "drops_keep": 200,
-  "public_base_url": "https://your-host.example.com"
+  "public_base_url": "https://your-host.example.com",
+
+  "encounter_db": "~/.attune/encounters.sqlite",
+  "encounter_listener_id": "default-listener"
 }

@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 numpy
+yt-dlp[default]
 
 # faster-whisper is only needed when ATTUNE_STT_MODE=local (the default).
 # It is a dependency of the vendored seven-ears engine, not of Attune

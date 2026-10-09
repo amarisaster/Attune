@@ -20,6 +20,10 @@ trust. Things worth knowing before exposing it anywhere:
   claude.ai custom connectors can't send bearer headers without full OAuth.
   URLs get logged by proxies — treat any URL containing the token as a
   credential.
+- **Sequential encounters inherit the shared-token boundary.** Tool callers
+  cannot supply a listener ID; all holders of one server token share the
+  configured `ATTUNE_ENCOUNTER_LISTENER_ID`. Use separate deployments when
+  listeners must be mutually isolated.
 - **URL fetching is allowlist-only and refuses redirects** by design. Keep
   `ATTUNE_ALLOWED_AUDIO_PREFIXES` as narrow as possible; every prefix you
   add is a place the server will fetch from on request.
@@ -29,6 +33,26 @@ trust. Things worth knowing before exposing it anywhere:
   anyone you wouldn't let run code-adjacent workloads on the box.
 - If you expose Attune to the internet, put it behind TLS + access control
   you already trust (reverse proxy, Cloudflare Tunnel, Tailscale Funnel).
+
+### Sequential encounter mode
+
+- Encounter databases contain private listening notes and unrevealed song
+  identity. Keep their directory mode at `0700`; the engine rejects a public
+  directory and forces the database to `0600` where the platform permits.
+- Blind delivery is a cooperative information boundary, not a sandbox. Do not
+  give an untrusted listener filesystem, database, source-audio, or process
+  access alongside the encounter API.
+- YouTube import accepts one validated HTTPS video from an exact YouTube host,
+  rejects playlists and credentials, enforces duration and byte limits, and
+  discards the source recording after opaque passage artifacts are produced.
+  Deployers remain responsible for law, platform terms, and rights to process
+  a recording.
+- First impressions and retrospectives are intentionally immutable. Backup or
+  deletion policy is a deployer responsibility; the public engine does not
+  silently expire journals.
+- The journal outbox accepts a caller-supplied delivery function. Never put
+  credentials inside payloads, exception messages, SQLite fields, or command
+  arguments.
 
 ## Supported versions
 
