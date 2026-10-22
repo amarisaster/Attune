@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from singing import load_wav
+from attune_encounter.vocal_perception import analyze_vocal_perception
 
 
 def analyze_vocal_texture(path: str) -> dict[str, Any]:
@@ -110,6 +111,16 @@ def _pitch_label(data: dict) -> tuple[str | None, float | None]:
 def analyze_voice_delivery(path: str, measurements: dict) -> dict:
     """Return measurements plus a short grounded description of delivery."""
     texture = analyze_vocal_texture(path)
+    samples, sample_rate = load_wav(path)
+    perception = analyze_vocal_perception(
+        samples,
+        sample_rate,
+        {"is_melodic": False, "notes": [], "glides": [], "vibrato": []},
+        texture,
+        source="direct_voice_recording",
+        content_kind="spoken_voice",
+        apply_residue_gate=False,
+    )
     descriptors: list[str] = []
     pace = _pace_label(measurements)
     if pace:
@@ -133,6 +144,7 @@ def analyze_voice_delivery(path: str, measurements: dict) -> dict:
         "summary": summary,
         "pitch_span_semitones": pitch_span,
         "texture": texture,
+        "vocal_perception": perception,
         "boundary": (
             "Recording and microphone conditions can change texture readings. "
             "These cues describe sound only; they do not prove emotion or intent."
@@ -153,5 +165,19 @@ def format_voice_delivery_section(result: dict) -> str:
         )
     else:
         lines.append(f"VOICE : unavailable ({texture.get('reason', 'insufficient evidence')})")
+    perception = result.get("vocal_perception") or {}
+    if perception.get("available"):
+        lines.append(f"PHRASE: {perception['summary']}")
+        onset = perception.get("onset_attack") or {}
+        if onset.get("available"):
+            lines.append(
+                "ENTRY : {kind} measured attack across {count} entrance{suffix}".format(
+                    kind=onset["dominant_character"],
+                    count=len(onset.get("events") or []),
+                    suffix="" if len(onset.get("events") or []) == 1 else "s",
+                )
+            )
+    else:
+        lines.append(f"PHRASE: unavailable ({perception.get('reason', 'insufficient evidence')})")
     lines.append(f"LIMIT : {result['boundary']}")
     return "\n".join(lines)

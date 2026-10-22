@@ -1,9 +1,10 @@
-"""Evidence-bound vocal perception for one already-revealed passage.
+"""Evidence-bound vocal perception for a music passage or voice recording.
 
-This module deliberately measures the separated vocal stem without claiming
-who is singing, what they feel, or which vocal technique produced a signal.
-Where a mono stem cannot support a claim (voice count, harmony, ad-lib
-identity), the result says so instead of manufacturing precision.
+This module measures either a separated vocal stem or a direct voice recording
+without claiming who is speaking or singing, what they feel, or which vocal
+technique produced a signal. Where mono audio cannot support a claim (voice
+count, harmony, secondary-speaker identity), the result says so instead of
+manufacturing precision.
 """
 
 from __future__ import annotations
@@ -75,7 +76,12 @@ def _frame_features(samples: np.ndarray, sample_rate: int) -> dict[str, np.ndarr
     return {name: np.asarray(values, dtype=float) for name, values in rows.items()}
 
 
-def _activity(features: dict[str, np.ndarray], duration_s: float) -> tuple[dict, np.ndarray, list[tuple[float, float]]]:
+def _activity(
+    features: dict[str, np.ndarray],
+    duration_s: float,
+    *,
+    source: str,
+) -> tuple[dict, np.ndarray, list[tuple[float, float]]]:
     levels = features["db"]
     if levels.size == 0:
         return ({"available": False, "reason": "not enough audio"}, np.asarray([], dtype=bool), [])
@@ -109,7 +115,7 @@ def _activity(features: dict[str, np.ndarray], duration_s: float) -> tuple[dict,
             "active_share": round(float(np.mean(active[start:stop])), 3),
         })
     support = min(1.0, contrast / 18.0) * min(1.0, duration_s / 8.0)
-    return ({
+    result = {
         "available": True,
         "classification": character,
         "confidence": _confidence(support),
@@ -123,9 +129,16 @@ def _activity(features: dict[str, np.ndarray], duration_s: float) -> tuple[dict,
         "exits_s": [round(end, 2) for _, end in phrases[:16]],
         "density_over_time": density,
         "threshold_dbfs": round(threshold, 1),
-        "separation_contrast_db": round(contrast, 1),
-        "claim_limit": "Activity is measured on the separated vocal stem; accompaniment bleed can create false activity.",
-    }, active, phrases)
+        "level_contrast_db": round(contrast, 1),
+        "claim_limit": (
+            "Activity is measured on the separated vocal stem; accompaniment bleed can create false activity."
+            if source == "separated_vocal_stem"
+            else "Activity is measured from the recording level; background sound can create false voice activity."
+        ),
+    }
+    if source == "separated_vocal_stem":
+        result["separation_contrast_db"] = result["level_contrast_db"]
+    return result, active, phrases
 
 
 def _onsets(features: dict[str, np.ndarray], phrases: Sequence[tuple[float, float]]) -> dict:
@@ -159,6 +172,8 @@ def _breath_like_events(
     features: dict[str, np.ndarray],
     phrases: Sequence[tuple[float, float]],
     noise_floor: float,
+    *,
+    source: str,
 ) -> dict:
     candidates = []
     levels = features["db"]
@@ -189,7 +204,11 @@ def _breath_like_events(
         "confidence": "low",
         "claim_limit": (
             "These are breath-like noise candidates before vocal entrances. "
-            "Stem artifacts, consonants, or accompaniment bleed can look similar; they are not confirmed breaths."
+            + (
+                "Stem artifacts, consonants, or accompaniment bleed can look similar; they are not confirmed breaths."
+                if source == "separated_vocal_stem"
+                else "Consonants, handling noise, or background sound can look similar; they are not confirmed breaths."
+            )
         ),
     }
 
@@ -296,7 +315,16 @@ def _pitch_events(singing: dict) -> dict:
     }
 
 
-def _summary(activity: dict, singing: dict, texture: dict, timbre: dict, pitch_events: dict) -> str:
+def _summary(
+    activity: dict,
+    singing: dict,
+    texture: dict,
+    timbre: dict,
+    pitch_events: dict,
+    *,
+    content_kind: str,
+    source: str,
+) -> str:
     parts = []
     classification = activity.get("classification")
     if classification:
@@ -322,7 +350,7 @@ def _summary(activity: dict, singing: dict, texture: dict, timbre: dict, pitch_e
             )
         else:
             parts.append("no stable vibrato pattern detected")
-    else:
+    elif content_kind == "singing":
         parts.append("no sufficiently stable sustained melody for pitch-detail claims")
     if texture.get("available") and texture.get("label"):
         parts.append(f"a {texture['label']} texture reading")
@@ -333,7 +361,8 @@ def _summary(activity: dict, singing: dict, texture: dict, timbre: dict, pitch_e
     if runs:
         parts.append(f"{len(runs)} rapid note-run candidate{'s' if len(runs) != 1 else ''}")
     if not parts:
-        return "The separated vocal stem did not support a stable vocal summary for this passage."
+        subject = "separated vocal stem" if source == "separated_vocal_stem" else "voice recording"
+        return f"The {subject} did not support a stable vocal summary for this passage."
     return parts[0].capitalize() + "; " + "; ".join(parts[1:]) + "."
 
 
@@ -342,17 +371,25 @@ def analyze_vocal_perception(
     sample_rate: int,
     singing: dict[str, Any],
     texture: dict[str, Any],
+    *,
+    source: str = "separated_vocal_stem",
+    content_kind: str = "singing",
+    apply_residue_gate: bool = True,
 ) -> dict[str, Any]:
     """Build a passage-local perceptual packet from measured vocal evidence."""
+    if source not in {"separated_vocal_stem", "direct_voice_recording"}:
+        raise ValueError(f"unsupported vocal source: {source}")
+    if content_kind not in {"singing", "spoken_voice"}:
+        raise ValueError(f"unsupported vocal content kind: {content_kind}")
     x = np.asarray(samples, dtype=float)
     duration_s = x.size / max(sample_rate, 1)
     features = _frame_features(x, sample_rate)
-    activity, _active_mask, phrases = _activity(features, duration_s)
+    activity, _active_mask, phrases = _activity(features, duration_s, source=source)
     if not activity.get("available"):
         return {
             "available": False,
             "reason": activity.get("reason", "not enough vocal evidence"),
-            "source": "separated_vocal_stem",
+            "source": source,
             "texture": texture,
         }
     # A separator always emits *something*, even for an instrumental tone.
@@ -362,34 +399,43 @@ def analyze_vocal_perception(
     periodicity = texture.get("periodicity_median")
     weak_voice_specific_evidence = (
         not singing.get("is_melodic")
-        and float(activity.get("separation_contrast_db") or 0.0) < 6.0
+        and float(activity.get("level_contrast_db") or 0.0) < 6.0
         and (
             not texture.get("available")
             or not isinstance(periodicity, (int, float))
             or periodicity < 0.38
         )
     )
-    if weak_voice_specific_evidence:
+    if apply_residue_gate and weak_voice_specific_evidence:
         return {
             "available": False,
             "reason": "the separated stem contained only weak non-melodic residue, not enough voice-specific evidence",
-            "source": "separated_vocal_stem",
-            "analysis_scope": "current_passage_only",
+            "source": source,
+            "analysis_scope": "current_passage_only" if source == "separated_vocal_stem" else "whole_recording",
             "vocal_activity": activity,
             "texture": texture,
             "limits": "Low-level separation residue was omitted rather than described as a singer.",
         }
     noise_floor = float(np.percentile(features["db"], 20)) if features["db"].size else -120.0
     onset = _onsets(features, phrases)
-    breaths = _breath_like_events(features, phrases, noise_floor)
+    breaths = _breath_like_events(features, phrases, noise_floor, source=source)
     timbre = _timbre_by_phrase(features, phrases)
     pitch_events = _pitch_events(singing)
     return {
         "available": True,
-        "source": "separated_vocal_stem",
-        "analysis_scope": "current_passage_only",
+        "source": source,
+        "content_kind": content_kind,
+        "analysis_scope": "current_passage_only" if source == "separated_vocal_stem" else "whole_recording",
         "measurement_version": 2,
-        "summary": _summary(activity, singing, texture, timbre, pitch_events),
+        "summary": _summary(
+            activity,
+            singing,
+            texture,
+            timbre,
+            pitch_events,
+            content_kind=content_kind,
+            source=source,
+        ),
         "vocal_activity": activity,
         "onset_attack": onset,
         "breath_like_events": breaths,
@@ -398,14 +444,26 @@ def analyze_vocal_perception(
         "texture": texture,
         "layered_vocals": {
             "available": False,
-            "reason": "simultaneous voice count and harmony are not reliable from the current separated stem without validated multi-pitch evidence",
+            "reason": (
+                "simultaneous voice count and harmony are not reliable from the current separated stem without validated multi-pitch evidence"
+                if source == "separated_vocal_stem"
+                else "simultaneous voice count and harmony are not reliable from a mono voice recording without validated multi-pitch evidence"
+            ),
         },
         "secondary_vocals": {
             "available": False,
-            "reason": "ad-libs and secondary-vocal entrances require voice separation or identity evidence this organ does not have",
+            "reason": (
+                "ad-libs and secondary-vocal entrances require voice separation or identity evidence this organ does not have"
+                if source == "separated_vocal_stem"
+                else "overlapping or secondary speakers require speaker-separation evidence this organ does not have"
+            ),
         },
         "limits": (
-            "Voice isolation can retain accompaniment or separation artifacts. "
-            "Measurements describe recorded sound, not singer identity, emotion, intent, culture-specific technique, or vocal health."
+            (
+                "Voice isolation can retain accompaniment or separation artifacts. "
+                if source == "separated_vocal_stem"
+                else "Microphone, room, compression, handling, and background sound can affect these measurements. "
+            )
+            + "Measurements describe recorded sound, not singer identity, emotion, intent, culture-specific technique, or vocal health."
         ),
     }

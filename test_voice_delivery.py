@@ -29,8 +29,13 @@ def _base() -> dict:
 
 def test_tonal_signal_gets_grounded_summary() -> None:
     sr = 22050
-    t = np.arange(sr * 2) / sr
-    signal = 0.45 * (np.sin(2 * np.pi * 180 * t) + 0.25 * np.sin(2 * np.pi * 360 * t))
+    signal = np.zeros(sr * 3)
+    for start_s, end_s in ((0.2, 1.2), (1.55, 2.75)):
+        start, end = round(start_s * sr), round(end_s * sr)
+        t = np.arange(end - start) / sr
+        signal[start:end] = 0.45 * (
+            np.sin(2 * np.pi * 180 * t) + 0.25 * np.sin(2 * np.pi * 360 * t)
+        )
     with tempfile.TemporaryDirectory() as root:
         path = Path(root) / "voice.wav"
         _write(path, signal, sr)
@@ -39,8 +44,20 @@ def test_tonal_signal_gets_grounded_summary() -> None:
     assert result["texture"]["label"] == "clear/tonal"
     assert "moderate measured pace" in result["summary"]
     assert "varied pitch movement" in result["summary"]
+    perception = result["vocal_perception"]
+    assert perception["available"] is True
+    assert perception["source"] == "direct_voice_recording"
+    assert perception["content_kind"] == "spoken_voice"
+    assert perception["analysis_scope"] == "whole_recording"
+    assert perception["vocal_activity"]["phrase_count"] >= 2
+    assert "level_contrast_db" in perception["vocal_activity"]
+    assert "separation_contrast_db" not in perception["vocal_activity"]
+    assert "separated vocal stem" not in str(perception).lower()
+    assert "sustained melody" not in perception["summary"]
     rendered = format_voice_delivery_section(result)
     assert "observed, not diagnosed" in rendered
+    assert "PHRASE:" in rendered
+    assert "ENTRY :" in rendered
     assert "do not prove emotion or intent" in rendered
 
 
