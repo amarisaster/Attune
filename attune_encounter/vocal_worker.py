@@ -21,9 +21,9 @@ ATTUNE_DIR = Path(os.environ.get(
 )).resolve()
 
 
-def _compact(result: dict, texture: dict) -> dict:
+def _compact(result: dict, texture: dict, perception: dict | None = None) -> dict:
     if not result.get("is_melodic"):
-        return {
+        return perception or {
             "available": False,
             "reason": "no sufficiently stable melodic vocal line was measured in this passage",
             "source": "separated_vocal_stem",
@@ -49,7 +49,7 @@ def _compact(result: dict, texture: dict) -> dict:
     if len(pitched) >= 2:
         delta = pitched[-1]["midi"] - pitched[0]["midi"]
         contour = "rising" if delta > 1 else "falling" if delta < -1 else "returning/level"
-    return {
+    compact = {
         "available": True,
         "source": "separated_vocal_stem",
         "analysis_scope": "current_passage_only",
@@ -63,6 +63,18 @@ def _compact(result: dict, texture: dict) -> dict:
         } if longest and longest.get("dur_s", 0.0) >= 0.5 else None),
         "glides": [{
             "from": item.get("from_note"), "to": item.get("to_note"),
+            "from_midi": item.get("from_midi"), "to_midi": item.get("to_midi"),
+            "direction": (
+                "falling" if isinstance(item.get("from_midi"), (int, float))
+                and isinstance(item.get("to_midi"), (int, float))
+                and item["to_midi"] < item["from_midi"]
+                else "rising" if isinstance(item.get("from_midi"), (int, float))
+                and isinstance(item.get("to_midi"), (int, float))
+                and item["to_midi"] > item["from_midi"]
+                else "level" if item.get("to_midi") == item.get("from_midi")
+                and item.get("to_midi") is not None
+                else None
+            ),
             "duration_s": item.get("dur_s"), "start_s": item.get("start_s"),
         } for item in glides[:8]],
         "vibrato": [{
@@ -81,6 +93,15 @@ def _compact(result: dict, texture: dict) -> dict:
             "These measurements describe sound, not singer identity, emotion, intent, or vocal health."
         ),
     }
+    if perception:
+        # The perceptual packet supplies temporal/timbral evidence and a
+        # listener-facing summary; keep the established melodic fields for
+        # backward-compatible consumers.
+        compact.update({
+            key: value for key, value in perception.items()
+            if key not in {"available", "source", "analysis_scope", "texture", "limits"}
+        })
+    return compact
 
 
 def main() -> None:
@@ -90,8 +111,9 @@ def main() -> None:
     sys.path.insert(0, str(ATTUNE_DIR))
     import numpy as np
     import stems
-    from singing import analyze_singing
+    from singing import analyze_singing, load_wav
     from voice_delivery import analyze_vocal_texture
+    from attune_encounter.vocal_perception import analyze_vocal_perception
 
     mixed = stems.load_stereo_44k(str(source))
     vocals = stems.separate(mixed)["vocals"]
@@ -111,7 +133,11 @@ def main() -> None:
                 output.setsampwidth(2)
                 output.setframerate(stems.SR)
                 output.writeframes(pcm.tobytes())
-            results.append(_compact(analyze_singing(str(path)), analyze_vocal_texture(str(path))))
+            singing = analyze_singing(str(path))
+            texture = analyze_vocal_texture(str(path))
+            mono, mono_rate = load_wav(str(path))
+            perception = analyze_vocal_perception(mono, mono_rate, singing, texture)
+            results.append(_compact(singing, texture, perception))
     json.dump({"passages": results}, sys.stdout, ensure_ascii=False, allow_nan=False)
 
 

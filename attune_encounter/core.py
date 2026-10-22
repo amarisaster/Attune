@@ -28,6 +28,7 @@ from .organs import analyze_passage
 ANALYSIS_SAMPLE_RATE = 16_000
 MOTION_SECONDS = 5.0
 FIXED_PASSAGE_SECONDS = 60.0
+MIN_TERMINAL_PASSAGE_SECONDS = 15.0
 ADAPTIVE_MIN_SECONDS = 45.0
 ADAPTIVE_MAX_SECONDS = 90.0
 MAX_AUDIO_SECONDS = 15 * 60
@@ -237,7 +238,8 @@ def passage_ranges(samples: Sequence[float], sample_rate: int, mode: str) -> lis
     total = len(samples)
     if mode == "fixed":
         step = round(FIXED_PASSAGE_SECONDS * sample_rate)
-        return [(start, min(total, start + step)) for start in range(0, total, step)]
+        ranges = [(start, min(total, start + step)) for start in range(0, total, step)]
+        return _fold_short_terminal_passage(ranges, sample_rate)
 
     minimum = round(ADAPTIVE_MIN_SECONDS * sample_rate)
     maximum = round(ADAPTIVE_MAX_SECONDS * sample_rate)
@@ -262,7 +264,20 @@ def passage_ranges(samples: Sequence[float], sample_rate: int, mode: str) -> lis
             candidate = min(hard_end, candidate + probe)
         ranges.append((start, chosen))
         start = chosen
-    return ranges
+    return _fold_short_terminal_passage(ranges, sample_rate)
+
+
+def _fold_short_terminal_passage(
+    ranges: list[tuple[int, int]], sample_rate: int,
+) -> list[tuple[int, int]]:
+    """Hide tiny ending stubs by folding them into the preceding passage."""
+    if len(ranges) < 2:
+        return ranges
+    final_start, final_end = ranges[-1]
+    if (final_end - final_start) / sample_rate >= MIN_TERMINAL_PASSAGE_SECONDS:
+        return ranges
+    prior_start, _ = ranges[-2]
+    return [*ranges[:-2], (prior_start, final_end)]
 
 
 def _motion(samples: Sequence[float], sample_rate: int, absolute_start: int) -> list[dict]:

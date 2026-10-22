@@ -180,7 +180,9 @@ class EncounterTests(unittest.TestCase):
         result = finish_encounter(self.db, ready["session_id"], "listener-a")
         self.assertEqual(result["identity"]["title"], "The Hidden Song")
         self.assertEqual(result["lyrics_provenance"]["source"], "human checked")
-        self.assertEqual(len(result["journal"]), 3)
+        # The five-second terminal stub is folded into passage two so its
+        # length cannot announce that the ending is five seconds away.
+        self.assertEqual(len(result["journal"]), 2)
         self.assertIn("separate retrospective", result["retrospective_prompt"])
 
     def test_private_database_permissions(self) -> None:
@@ -255,7 +257,12 @@ class EncounterTests(unittest.TestCase):
     def test_fixed_passages_are_sixty_seconds(self) -> None:
         ranges = passage_ranges(tone(125), ANALYSIS_SAMPLE_RATE, "fixed")
         self.assertEqual([(a / ANALYSIS_SAMPLE_RATE, b / ANALYSIS_SAMPLE_RATE) for a, b in ranges],
-                         [(0.0, 60.0), (60.0, 120.0), (120.0, 125.0)])
+                         [(0.0, 60.0), (60.0, 125.0)])
+
+    def test_terminal_passage_at_threshold_remains_separate(self) -> None:
+        ranges = passage_ranges(tone(135), ANALYSIS_SAMPLE_RATE, "fixed")
+        self.assertEqual([(a / ANALYSIS_SAMPLE_RATE, b / ANALYSIS_SAMPLE_RATE) for a, b in ranges],
+                         [(0.0, 60.0), (60.0, 120.0), (120.0, 135.0)])
 
     def test_finish_queues_generic_journal_record(self) -> None:
         ready = self.complete(listener="listener-c")

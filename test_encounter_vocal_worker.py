@@ -16,7 +16,10 @@ class VocalWorkerTests(unittest.TestCase):
                     {"note_name": "C4", "dur_s": 0.2},
                     {"note_name": "G4", "dur_s": 1.4},
                 ],
-                "glides": [{"from_note": "C4", "to_note": "G4", "dur_s": 0.6, "start_s": 3.2}],
+                "glides": [{
+                    "from_note": "C4", "to_note": "G4", "from_midi": 60,
+                    "to_midi": 67, "dur_s": 0.6, "start_s": 3.2,
+                }],
                 "vibrato": [{"note_name": "G4", "rate_hz": 5.4, "extent_cents": 62}],
                 "dynamics": {"dynamic_range_db": 18.2, "start_db": -31.0, "end_db": -24.0, "segments": []},
             },
@@ -25,6 +28,7 @@ class VocalWorkerTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertEqual(result["source"], "separated_vocal_stem")
         self.assertEqual(result["held_note"], {"note": "G4", "duration_s": 1.4})
+        self.assertEqual(result["glides"][0]["direction"], "rising")
         self.assertNotIn("notes", result)
         self.assertNotIn("identity", result)
         self.assertIn("not singer identity", result["limits"])
@@ -33,6 +37,21 @@ class VocalWorkerTests(unittest.TestCase):
         result = _compact({"is_melodic": False}, {"available": False, "reason": "quiet"})
         self.assertFalse(result["available"])
         self.assertEqual(result["source"], "separated_vocal_stem")
+
+    def test_nonmelodic_passage_keeps_available_temporal_evidence(self) -> None:
+        perception = {
+            "available": True,
+            "source": "separated_vocal_stem",
+            "summary": "Fragmented vocal activity.",
+            "vocal_activity": {"classification": "fragmented vocal activity"},
+        }
+        result = _compact(
+            {"is_melodic": False},
+            {"available": True, "label": "clear/tonal"},
+            perception,
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["summary"], "Fragmented vocal activity.")
 
 
 if __name__ == "__main__":

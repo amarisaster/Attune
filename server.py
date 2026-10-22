@@ -114,6 +114,24 @@ def _cfg_float(env_name: str, json_key: str, default: float) -> float:
     return default
 
 
+def _cfg_bool(env_name: str, json_key: str, default: bool) -> bool:
+    value = os.environ.get(env_name)
+    if value is not None:
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        print(
+            f"[attune] WARNING: {env_name}={value!r} is not a boolean, using default {default}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return default
+    value = _JSON_CONFIG.get(json_key)
+    return value if isinstance(value, bool) else default
+
+
 def _cfg_list(env_name: str, json_key: str, default=()) -> list:
     v = os.environ.get(env_name)
     if v is not None:
@@ -176,7 +194,17 @@ CONFIG = {
     'encounter_listener_id': _cfg_str(
         'ATTUNE_ENCOUNTER_LISTENER_ID', 'encounter_listener_id', 'default-listener'
     ),
+    'encounter_vocal_analysis': _cfg_bool(
+        'ATTUNE_ENCOUNTER_VOCAL_ANALYSIS', 'encounter_vocal_analysis', False
+    ),
 }
+
+# The encounter core may also run in a worker subprocess. Normalize the
+# resolved JSON/env setting back into its environment so both paths use the
+# same configuration without importing the FastAPI server from the engine.
+os.environ['ATTUNE_ENCOUNTER_VOCAL_ANALYSIS'] = (
+    'true' if CONFIG['encounter_vocal_analysis'] else 'false'
+)
 
 if CONFIG['stt_mode'] not in ('local', 'webhook', 'none'):
     print(f"[attune] FATAL: ATTUNE_STT_MODE={CONFIG['stt_mode']!r} must be one of "
@@ -192,7 +220,8 @@ print(
     'stt_mode={stt_mode} whisper_model={whisper_model} stt_url={stt_url} '
     'stt_silence_dbfs={stt_silence_dbfs} '
     'allowed_audio_prefixes={n_prefixes} configured max_upload_bytes={max_upload_bytes} '
-    'drops_dir={drops_dir} drops_keep={drops_keep} public_base_url={public_base_url}'.format(
+    'drops_dir={drops_dir} drops_keep={drops_keep} public_base_url={public_base_url} '
+    'encounter_vocal_analysis={encounter_vocal_analysis}'.format(
         port=CONFIG['port'],
         token_file=CONFIG['token_file'],
         ffmpeg_dir=CONFIG['ffmpeg_dir'] or '(relying on PATH)',
@@ -205,6 +234,7 @@ print(
         drops_dir=CONFIG['drops_dir'],
         drops_keep=CONFIG['drops_keep'],
         public_base_url=CONFIG['public_base_url'] or '(derived from Host header)',
+        encounter_vocal_analysis=CONFIG['encounter_vocal_analysis'],
     ),
     file=sys.stderr, flush=True,
 )

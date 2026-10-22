@@ -48,8 +48,17 @@ encounter rather than a whole-song summary:
   lyrics, creator captions, automatic captions, and unavailable lyrics;
 - passage-local spectral balance, pitch-class color, transient activity, and
   supported local pulse are measured without normalizing against the future;
-- optional source-separated vocal evidence reports measured pitch movement,
-  held notes, glides, vibrato, dynamics, and cautious texture indicators;
+- optional source-separated vocal evidence reports measured vocal density and
+  phrase timing, entrances/exits, onset character, breath-like noise candidates,
+  held notes, pitch transitions, glides/falls, vibrato rate and depth, rapid
+  note-run candidates, dynamics, phrase-local timbral movement, and cautious
+  texture indicators;
+- each vocal packet includes a listener-facing evidence summary while retaining
+  its raw measurements, confidence, provenance, and claim limits; simultaneous
+  voice count, harmony, ad-lib identity, singer identity, emotion, and vocal
+  health remain explicitly unavailable without defensible evidence;
+- terminal passages shorter than 15 seconds are folded into the preceding
+  passage so a tiny final packet does not reveal that the recording is ending;
 - SQLite state, opaque passage tokens, exact-retry idempotency, immutable
   retrospectives, and a durable callback-driven journal outbox survive restarts.
 
@@ -143,6 +152,7 @@ default, without consulting the JSON file either.
 | `ATTUNE_PUBLIC_BASE_URL` | `public_base_url` | *(unset)* | Public origin used to build the `url` returned by `POST /api/drop`, e.g. `https://your-host`. When unset, derived from the request's `Host` header — set this explicitly if Attune sits behind a reverse proxy/tunnel that terminates TLS or rewrites `Host` |
 | `ATTUNE_ENCOUNTER_DB` | `encounter_db` | `~/.attune/encounters.sqlite` | Private SQLite state for sequential first-listen encounters |
 | `ATTUNE_ENCOUNTER_LISTENER_ID` | `encounter_listener_id` | `default-listener` | One server-owned listener namespace used by the shared-token MCP |
+| `ATTUNE_ENCOUNTER_VOCAL_ANALYSIS` | `encounter_vocal_analysis` | `false` | Enable the heavier source-separated vocal-perception worker for sequential encounters |
 
 **STT modes**, when the caller doesn't already supply a transcript:
 
