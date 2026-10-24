@@ -7,6 +7,11 @@ from unittest.mock import patch
 import server
 
 
+async def _inline_to_thread(function, *args, **kwargs):
+    """Keep this unit test about MCP attachment shape, not executor plumbing."""
+    return function(*args, **kwargs)
+
+
 class EncounterMCPTests(unittest.TestCase):
     def test_public_tool_set_is_complete_and_listener_is_not_caller_controlled(self) -> None:
         tools = {tool["name"]: tool for tool in server._mcp_encounter_tool_defs()}
@@ -26,6 +31,7 @@ class EncounterMCPTests(unittest.TestCase):
     def test_next_passage_attaches_audio_without_exposing_another_namespace(self) -> None:
         packet = {"complete": False, "session_id": "session", "passage_id": "passage"}
         with patch.dict(server.CONFIG, {"encounter_listener_id": "server-listener"}), \
+                patch("server.asyncio.to_thread", new=_inline_to_thread), \
                 patch("attune_encounter.next_passage", return_value=packet.copy()) as next_mock, \
                 patch(
                     "attune_encounter.passage_audio",
